@@ -1,4 +1,4 @@
-// Creator tools for memory maps (plan 2026-10-20-camera-map-updates; Keven: creators make and
+// Creator tools for memory maps (plan 2026-10-20-camera-map-updates; owner: creators make and
 // repair maps without us). find and check read the running game with the read-only fm_platform
 // Reader and the host's fm_memory checks, so a result here is the result in the game (Windows
 // only). pin writes each map digest into the feature's pins (plan 6c: no signature of ours).
@@ -11,7 +11,7 @@ pub struct Options<'a> {
     /// The aspect of `--size`, else None (the window).
     pub size: Option<f32>,
     /// `--trace <file>`: one JSON line per read of `check`, with the state of each kept copy, so a
-    /// failed check shows its cause (R4 run 1 on AgentBetty failed with no such record).
+    /// failed check shows its cause (R4 run 1 on a test PC failed with no such record).
     pub trace: Option<&'a str>,
 }
 

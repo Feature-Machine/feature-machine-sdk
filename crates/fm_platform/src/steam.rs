@@ -57,7 +57,7 @@ mod tests {
     use crate::games::Game;
     use std::fs;
 
-    // A Steam folder like WorkBetty's: ATS in the main library, MSFS in a second library, plus a
+    // A Steam folder like the one of a test PC: ATS in the main library, MSFS in a second library, plus a
     // stale library entry that no longer exists on disk.
     fn fixture(ats_flags: u32) -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();

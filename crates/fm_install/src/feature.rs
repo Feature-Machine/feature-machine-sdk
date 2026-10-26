@@ -139,7 +139,7 @@ impl Manifest {
             return Err(bad("map_contracts names a map that is not pinned, or a contract that is not a camera contract".into()));
         }
         if !memory && !write && self.memory_maps.is_empty() { return Ok(()); }
-        // A render_depth feature may pin camera maps without vars_memory (Keven, plan 7.5): the
+        // A render_depth feature may pin camera maps without vars_memory (owner decision, plan 7.5): the
         // host reads them for the shader host block only. Verification refuses other contracts.
         let camera = !memory && !write && self.capabilities.contains(&Capability::RenderDepth);
         if self.api < 5 || !(camera || memory && self.capabilities.contains(&Capability::VarsRead)) || self.memory_maps.is_empty() || self.memory_maps.len() > 32 {
@@ -396,7 +396,7 @@ pub struct CatalogEntry {
 }
 
 /// The public key of the feature feed. Its own key, not the app updater key: the publishing
-/// pipeline holds only this one, so a leak there cannot sign an app update (Keven 2026-10-24).
+/// pipeline holds only this one, so a leak there cannot sign an app update (owner decision 2026-10-24).
 pub fn feed_key() -> &'static str {
     include_str!("../keys/feature-feed.pub").trim()
 }

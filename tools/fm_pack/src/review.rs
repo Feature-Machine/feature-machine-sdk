@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(s["additionalProperties"], false, "the model must not add fields");
     }
 
-    // The three simulated reviews of 2026-10-24 (Codex rollouts 08:54, 08:54 and 09:39), written
+    // The three simulated reviews of 2026-10-24 (model runs 08:54, 08:54 and 09:39), written
     // as verdict data with their feature.json: trip 0.2.1 approve, live_weather 0.1.7 deny
     // (std::fs and process listing), live_weather 0.1.8 approve (user files service).
     #[test]

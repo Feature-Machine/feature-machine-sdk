@@ -37,7 +37,7 @@ pub enum Source {
     MicrosoftStore,
 }
 
-/// One install of one game. A PC can have several (WorkBetty has MSFS 2024 from Steam and Store).
+/// One install of one game. A PC can have several (a test PC has MSFS 2024 from Steam and Store).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GameInstall {
     pub game: Game,
@@ -63,7 +63,7 @@ pub(crate) struct GameDef {
     /// EXE path inside the install folder on this OS. None: the game does not run natively here.
     pub exe_rel: Option<&'static str>,
     /// Command line items that start the game EXE as a tool with no game session, for example
-    /// MSFS that fspackagetool starts to build packages (seen 2026-10-17 on WorkBetty).
+    /// MSFS that fspackagetool starts to build packages (seen 2026-10-17 on a test PC).
     pub tool_args: &'static [&'static str],
 }
 

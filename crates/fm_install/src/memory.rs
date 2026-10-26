@@ -1,6 +1,6 @@
 // Memory-enabled features carry independently signed maps and one signed session record. The
 // record binds consent metadata, host requirements and every package file before code loads.
-// Camera-only features (plan 2026-10-20-camera-map-updates 6c, Keven 2026-10-21) carry their
+// Camera-only features (plan 2026-10-20-camera-map-updates 6c, 2026-10-21) carry their
 // camera maps as plain package files, bound by the manifest pins, with no signature of ours.
 use crate::feature::{Manifest, MapDependency};
 use fm_memory::{Locator, Map};
@@ -20,7 +20,7 @@ const LIMIT: usize = 256 * 1024 * 1024;
 pub struct MapPackage {
     pub kind: String, pub contract: String,
     /// Exactly one of the two: an exact map (pinned to one exe digest) or a camera locator
-    /// recipe (limits only, not pinned; plan 2026-10-20-camera-map-updates, Keven decision 2).
+    /// recipe (limits only, not pinned; plan 2026-10-20-camera-map-updates, owner decision 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub map: Option<Map>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,7 +81,7 @@ fn pinned(bytes: &[u8], expected: &MapDependency) -> Result<Signed, String> {
 /// A feature without vars_memory and vars_write. Its manifest check allows only render_depth
 /// camera maps, and the map check below allows only camera contracts. Its maps need no
 /// signature of ours: the feature library already runs in the game without one, so our
-/// signature on a read-only map adds no safety and only stops a creator (Keven, plan 6c).
+/// signature on a read-only map adds no safety and only stops a creator (owner decision, plan 6c).
 pub fn camera_only(m: &Manifest) -> bool {
     !m.capabilities.contains(&fm_feature_sdk::Capability::VarsMemory) && !m.capabilities.contains(&fm_feature_sdk::Capability::VarsWrite)
 }
@@ -483,7 +483,7 @@ mod tests {
     }
 
     // A locator recipe needs its own contract and holds no map; a map review never approves a
-    // scan, and a locator review never approves symbols (Keven decision 2: read-only, unpinned).
+    // scan, and a locator review never approves symbols (owner decision 2: read-only, unpinned).
     #[test]
     fn locators_need_the_locator_contract_and_no_map() {
         let locator = serde_json::json!({ "schema": 1, "id": "msfs2024-camera-locator", "version": "1.0.0", "game": "msfs2024",
@@ -505,7 +505,7 @@ mod tests {
         assert!(Signed::Locator(serde_json::from_value(locator).unwrap()).is_camera(), "render_depth may pin a locator");
     }
 
-    // Keven 2026-10-21 (plan 6c): a camera-only feature carries its maps like its library, with
+    // Owner decision 2026-10-21 (plan 6c): a camera-only feature carries its maps like its library, with
     // no signature of ours, so a creator ships and repairs them alone. Its pins bind each map,
     // and only camera contracts for its games pass.
     fn camera_files(map: serde_json::Value) -> (BTreeMap<String, Vec<u8>>, Manifest) {

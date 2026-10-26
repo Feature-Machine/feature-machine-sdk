@@ -35,7 +35,7 @@ mod win {
                     CloseHandle(snap);
                     if !found { return Err(Error::Unavailable("map does not name the main module".into())); }
                     // The Microsoft Store build refuses file reads from other processes (2026-10-20,
-                    // AgentBetty 1.9.18.0). Then the identity has no digest: every exact map refuses
+                    // test PC, 1.9.18.0). Then the identity has no digest: every exact map refuses
                     // (its digest never matches ""), and a camera locator, which needs none, still reads.
                     let digest = (|| -> std::io::Result<String> {
                         let mut file = std::fs::File::open(wide(&entry.szExePath))?;

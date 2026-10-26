@@ -224,7 +224,7 @@ fn a_located_set_resumed_after_a_gap_proves_itself_again() {
     assert!(found.read(&h, &l, ASPECT, later + Duration::from_millis(16)).is_ok());
 }
 
-// R4 run 1 on AgentBetty (2026-10-21) failed with one text for three causes, so its cause stayed
+// R4 run 1 on a test PC (2026-10-21) failed with one text for three causes, so its cause stayed
 // unknown. Each miss now names its reason, and `inspect` shows the state of each kept copy.
 #[test]
 fn each_miss_names_its_reason() {

@@ -94,7 +94,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The physical place of a path: links and junctions of its nearest existing folder resolved,
 /// then the missing rest added (a Community folder that does not exist yet). Two MSFS installs
-/// can name one folder (on WorkBetty the Store Community is a junction to the Steam one), so
+/// can name one folder (on one test PC the Store Community is a junction to the Steam one), so
 /// path text alone placed and recorded each file twice.
 pub fn physical(p: &Path) -> PathBuf {
     let (mut at, mut rest) = (p, vec![]);
@@ -282,7 +282,7 @@ pub enum Kept {
 }
 
 /// A folder link for tests: a junction on Windows (as the MSFS Store Community folder on
-/// WorkBetty), a symlink elsewhere.
+/// one test PC), a symlink elsewhere.
 #[cfg(test)]
 pub(crate) fn link_dir(link: &Path, target: &Path) {
     #[cfg(windows)]

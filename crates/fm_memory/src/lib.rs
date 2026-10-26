@@ -249,7 +249,7 @@ struct Native { span: u64, len: usize, value_at: usize, mirror_at: usize, clamp:
 #[derive(Clone)]
 struct Resolved { symbol: Symbol, address: u64, guard: u64, pattern: Vec<Option<u8>>, type_guard: Option<(u64, [u8; 8])>, native: Option<Native>, proved: bool, watch: Option<(u64, u32)>, found: Option<Found>, failed: Option<String> }
 
-/// The saved result of a v2 map proved on one exe (plan 2026-10-23, Keven answer 2: save per
+/// The saved result of a v2 map proved on one exe (plan 2026-10-23, owner answer 2: save per
 /// build). It only skips the pattern search and the watch at the next start on that exe:
 /// `Map::resolve_proved` checks each pattern, vtable, class, handler and setter state again,
 /// and a record that differs is refused. It holds RVAs only, never code or an address to call.
@@ -807,7 +807,7 @@ impl<M: Memory> Runtime<M> {
         Ok(())
     }
 
-    /// The read-only watch of v2 symbols (Keven 2026-10-23: checks, then watch, then writes).
+    /// The read-only watch of v2 symbols (owner decision 2026-10-23: checks, then watch, then writes).
     /// Call it about once a second with a monotonic `now_ms`. Each call reads every unproved
     /// symbol: guards, value, mirror and clamp as at resolution. A failed read starts its watch
     /// again; `WATCH_READS` passes over `WATCH_MS` prove it. Returns the keys proved now.

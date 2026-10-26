@@ -526,7 +526,7 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    // The SDK must come from the public SDK repository at a release tag (Keven, plan L4): a fork,
+    // The SDK must come from the public SDK repository at a release tag (owner decision, plan L4): a fork,
     // another source, no tag, a path SDK in a creator repository or two SDKs stop the build.
     #[test]
     fn the_sdk_comes_from_the_public_repository_at_a_tag() {

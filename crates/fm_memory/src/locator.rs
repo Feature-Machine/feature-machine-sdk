@@ -131,7 +131,7 @@ impl Located {
     }
 
     /// `read` with the state of each kept copy and the reason of a miss. The creator tools show
-    /// both, so a failed check names its cause (R4 run 1 on AgentBetty gave one text for three
+    /// both, so a failed check names its cause (R4 run 1 on a test PC gave one text for three
     /// causes, and its cause stayed unknown). The result is the same as `read`.
     pub fn inspect<M: Memory>(&mut self, memory: &M, locator: &Locator, aspect: f32, now: Instant) -> (Vec<CopyRead>, Result<Scalar, Miss>) {
         let copies: Vec<CopyRead> = self.copies.iter_mut().map(|(a, live)| {
