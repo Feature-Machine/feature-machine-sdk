@@ -21,20 +21,33 @@ fn sha256(bytes: &[u8]) -> String {
 /// GitHub runner, 2026-10-26), the release does not. The first call downloads and checks the zip
 /// into %LOCALAPPDATA%\fm_pack; each call checks the files again before use.
 pub fn compiler() -> Result<PathBuf, String> {
+    let cache = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or("LOCALAPPDATA is not set")?.join("fm_pack");
+    compiler_in(&cache)
+}
+
+/// The compiler in `cache`. One file lock covers the check, the repair and the publish, so two
+/// fm_pack processes never repair the same cache at once (review r1: one could delete the
+/// other's folder). A good cache is never deleted, so a compile that runs after the lock is safe.
+fn compiler_in(cache: &Path) -> Result<PathBuf, String> {
     let m: serde_json::Value = serde_json::from_str(MANIFEST).map_err(|e| e.to_string())?;
     let c = &m["compiler"];
     let (url, zip_sha) = (c["url"].as_str(), c["sha256"].as_str());
     let (Some(url), Some(zip_sha), Some(hashes)) = (url, zip_sha, c["hashes"].as_object()) else {
         return Err("fm_render manifest.json has no compiler url, sha256 and hashes".into());
     };
-    let cache = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or("LOCALAPPDATA is not set")?.join("fm_pack");
-    let dir = cache.join(format!("dxc-{}", &zip_sha[..16.min(zip_sha.len())]));
+    let err = |p: &Path| { let p = p.display().to_string(); move |e: std::io::Error| format!("{p}: {e}") };
+    std::fs::create_dir_all(cache).map_err(err(cache))?;
+    let lock_path = cache.join("dxc.lock");
+    let lock = std::fs::File::create(&lock_path).map_err(err(&lock_path))?;
+    lock.lock().map_err(err(&lock_path))?;
+    let name = format!("dxc-{}", &zip_sha[..16.min(zip_sha.len())]);
+    let (dir, zip) = (cache.join(&name), cache.join(format!("{name}.zip")));
     let bin = dir.join("bin").join("x64");
-    if dir.exists() && pinned(&bin, hashes).is_err() {
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if pinned(&bin, hashes).is_err() {
+        if dir.exists() { std::fs::remove_dir_all(&dir).map_err(err(&dir))?; }
+        fetch(url, zip_sha, &zip, &dir)?;
+        pinned(&bin, hashes)?;
     }
-    if !dir.exists() { fetch(url, zip_sha, &cache, &dir)?; }
-    pinned(&bin, hashes)?;
     Ok(bin.join("dxc.exe"))
 }
 
@@ -48,29 +61,28 @@ fn pinned(bin: &Path, hashes: &serde_json::Map<String, serde_json::Value>) -> Re
     Ok(())
 }
 
-/// Downloads the release zip, checks its SHA-256, unpacks it in a folder of this process, then
-/// renames that folder to `dir` (one step, so a parallel fm_pack never sees half a compiler).
-fn fetch(url: &str, want: &str, cache: &Path, dir: &Path) -> Result<(), String> {
-    let work = cache.join(format!("download-{}", std::process::id()));
+/// Unpacks the release zip into `dir` (the caller holds the cache lock). The zip stays in the
+/// cache; it is downloaded only when it is missing or has another SHA-256, so a damaged unpack
+/// is repaired with no network. The unpack goes to a work folder first, then one rename.
+fn fetch(url: &str, want: &str, zip: &Path, dir: &Path) -> Result<(), String> {
+    let run = |cmd: &mut std::process::Command| match cmd.output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!("{:?} failed: {}", cmd, String::from_utf8_lossy(&o.stderr))),
+        Err(e) => Err(format!("{:?}: {e}", cmd)),
+    };
+    let zip_ok = |z: &Path| std::fs::read(z).map(|b| sha256(&b) == want).unwrap_or(false);
+    if !zip_ok(zip) {
+        let part = zip.with_extension("zip.part");
+        let _ = std::fs::remove_file(&part);
+        run(std::process::Command::new(CURL).args(["-fsSL", "--retry", "3", "-o"]).arg(&part).arg(url))?;
+        if !zip_ok(&part) { let _ = std::fs::remove_file(&part); return Err(format!("{url} is not the pinned zip (SHA-256 {want})")); }
+        std::fs::rename(&part, zip).map_err(|e| format!("{}: {e}", zip.display()))?;
+    }
+    let work = dir.with_extension("work");
     let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(work.join("x")).map_err(|e| format!("{}: {e}", work.display()))?;
-    let zip = work.join("dxc.zip");
-    let result = (|| {
-        let run = |cmd: &mut std::process::Command| match cmd.output() {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(format!("{:?} failed: {}", cmd, String::from_utf8_lossy(&o.stderr))),
-            Err(e) => Err(format!("{:?}: {e}", cmd)),
-        };
-        run(std::process::Command::new(CURL).args(["-fsSL", "--retry", "3", "-o"]).arg(&zip).arg(url))?;
-        let got = sha256(&std::fs::read(&zip).map_err(|e| format!("{}: {e}", zip.display()))?);
-        if got != want { return Err(format!("{url} has SHA-256 {got}, not the pinned {want}")); }
-        run(std::process::Command::new(TAR).arg("-x").arg("-f").arg(&zip).current_dir(work.join("x")))?;
-        // Another fm_pack can rename first: then its folder is the compiler, and pinned() checks it.
-        if std::fs::rename(work.join("x"), dir).is_err() && !dir.exists() {
-            return Err(format!("{}: cannot place the compiler", dir.display()));
-        }
-        Ok(())
-    })();
+    std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+    let result = run(std::process::Command::new(TAR).arg("-x").arg("-f").arg(zip).current_dir(&work))
+        .and_then(|()| std::fs::rename(&work, dir).map_err(|e| format!("{}: {e}", dir.display())));
     let _ = std::fs::remove_dir_all(&work);
     result
 }
@@ -145,6 +157,46 @@ mod tests {
         std::fs::write(dir.join("dxc.exe"), b"good").unwrap();
         assert!(super::pinned(&dir, &hashes).is_err(), "a missing file is refused");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Review r1: fm_pack processes that find one damaged cache at the same time must all get the
+    // compiler. Six copies of this test binary run `repair_child` on one cache with a bad dxc.exe
+    // and the checked zip (copied from the real cache when it has one; else the first child
+    // downloads it). Without the cache lock, one process deletes or replaces the folder of another.
+    #[cfg(windows)]
+    #[test]
+    fn processes_that_repair_one_cache_at_once_all_succeed() {
+        let real = super::compiler().unwrap();
+        let real_dir = real.parent().and_then(std::path::Path::parent).and_then(std::path::Path::parent).unwrap();
+        let cache = std::env::temp_dir().join(format!("fm-pack-dxc-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let dir = cache.join(real_dir.file_name().unwrap());
+        std::fs::create_dir_all(dir.join("bin").join("x64")).unwrap();
+        std::fs::write(dir.join("bin").join("x64").join("dxc.exe"), b"damaged").unwrap();
+        if real_dir.with_extension("zip").is_file() {
+            std::fs::copy(real_dir.with_extension("zip"), dir.with_extension("zip")).unwrap();
+        }
+        let exe = std::env::current_exe().unwrap();
+        let running: Vec<_> = (0..6).map(|_| std::process::Command::new(&exe)
+            .args(["--exact", "shaders::tests::repair_child", "--nocapture"])
+            .env("FM_PACK_REPAIR_CACHE", &cache)
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().unwrap()).collect();
+        let children: Vec<_> = running.into_iter().map(|c| c.wait_with_output().unwrap()).collect();
+        for c in &children {
+            assert!(c.status.success(), "{}{}", String::from_utf8_lossy(&c.stdout), String::from_utf8_lossy(&c.stderr));
+        }
+        let m: serde_json::Value = serde_json::from_str(super::MANIFEST).unwrap();
+        assert!(super::pinned(&dir.join("bin").join("x64"), m["compiler"]["hashes"].as_object().unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    // One repair process of the test above; it does nothing in a normal test run.
+    #[test]
+    fn repair_child() {
+        let Some(cache) = std::env::var_os("FM_PACK_REPAIR_CACHE") else { return };
+        let dxc = super::compiler_in(std::path::Path::new(&cache)).unwrap();
+        assert!(dxc.is_file());
     }
 
     // A bad file name stops before the compiler, so this runs on every system.
