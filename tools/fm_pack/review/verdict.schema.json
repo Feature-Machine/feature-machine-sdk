@@ -1,0 +1,185 @@
+{
+  "$defs": {
+    "BriefLine": {
+      "additionalProperties": false,
+      "properties": {
+        "capability": {
+          "description": "A capability of feature.json, named exactly as there (for example \"vars_read\").",
+          "type": "string"
+        },
+        "text": {
+          "description": "What the feature does with it, in plain words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "text"
+      ],
+      "type": "object"
+    },
+    "Decision": {
+      "enum": [
+        "approve",
+        "deny"
+      ],
+      "type": "string"
+    },
+    "FeatureRef": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "declared": {
+          "description": "Whether feature.json declares that power.",
+          "type": "boolean"
+        },
+        "file": {
+          "description": "Relative to the repository root, with \"/\" separators.",
+          "type": "string"
+        },
+        "line": {
+          "description": "The first line of the problem.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "power": {
+          "description": "The power that the code uses, for example \"direct file access\".",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "file",
+        "line",
+        "power",
+        "declared",
+        "what",
+        "why"
+      ],
+      "type": "object"
+    },
+    "PowerUse": {
+      "additionalProperties": false,
+      "properties": {
+        "declared": {
+          "description": "What feature.json declares for it (\"none\" when nothing).",
+          "type": "string"
+        },
+        "matches": {
+          "description": "True when the use stays inside the declaration.",
+          "type": "boolean"
+        },
+        "power": {
+          "type": "string"
+        },
+        "used": {
+          "description": "What the shipped code uses (\"none\" when nothing).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "power",
+        "declared",
+        "used",
+        "matches"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The answer of the safety reviewer (review/policy.md, \"Answer\").",
+  "properties": {
+    "brief": {
+      "description": "One line for each capability in feature.json, for the member.",
+      "items": {
+        "$ref": "#/$defs/BriefLine"
+      },
+      "type": "array"
+    },
+    "cleared": {
+      "description": "Risks that the reviewer checked and found safe.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "feature": {
+      "$ref": "#/$defs/FeatureRef",
+      "description": "The id and version in the reviewed feature.json."
+    },
+    "findings": {
+      "description": "Safety findings only, most severe first. Empty for approve.",
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "type": "array"
+    },
+    "powers": {
+      "description": "One row for each power that the feature declares or uses.",
+      "items": {
+        "$ref": "#/$defs/PowerUse"
+      },
+      "type": "array"
+    },
+    "quality": {
+      "description": "Short notes for the public quality score; never a reason to deny.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "reason": {
+      "description": "One or two plain sentences: why.",
+      "type": "string"
+    },
+    "verdict": {
+      "$ref": "#/$defs/Decision",
+      "description": "approve when there is no safety finding, else deny."
+    }
+  },
+  "required": [
+    "feature",
+    "verdict",
+    "reason",
+    "findings",
+    "powers",
+    "brief",
+    "quality",
+    "cleared"
+  ],
+  "title": "Verdict",
+  "type": "object"
+}

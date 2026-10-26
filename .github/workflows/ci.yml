@@ -1,0 +1,29 @@
+# Checks of the SDK repository itself: the tests and the lint of every crate on Windows, with the
+# compiler of rust-toolchain.toml (rustup installs it). The creator workflow is
+# feature-machine.yml; it runs on creator repositories, not here.
+name: SDK checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust with clippy
+        run: rustup component add clippy
+
+      - name: cargo test
+        run: cargo test --locked --workspace
+
+      - name: cargo clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings

@@ -1,0 +1,29 @@
+{
+  "feature": { "id": "live-weather", "version": "0.1.8" },
+  "verdict": "approve",
+  "reason": "Version 0.1.8 moves game file access to the user files service and the game running check to the SDK. No undeclared power is left.",
+  "findings": [],
+  "powers": [
+    { "power": "vars_read", "declared": "yes", "used": "truck position, pause state", "matches": true },
+    { "power": "game_command", "declared": "g_bad_weather_factor, g_set_weather, g_set_skybox", "used": "those three commands through the SDK", "matches": true },
+    { "power": "network", "declared": "tgftp.nws.noaa.gov", "used": "HTTPS GET of station reports through the SDK", "matches": true },
+    { "power": "ui_app", "declared": "index.html", "used": "state messages, sandboxed page", "matches": true },
+    { "power": "user_files", "declared": "game.log.txt read; profiles/*/config.cfg and steam_profiles/*/config.cfg write", "used": "those files through the UserFiles service", "matches": true },
+    { "power": "feature data folder", "declared": "SDK data folder", "used": "repair journal", "matches": true },
+    { "power": "direct file, process or registry access", "declared": "none", "used": "none", "matches": true }
+  ],
+  "brief": [
+    { "capability": "vars_read", "text": "Reads the truck position and the pause state to choose the weather and the time of day." },
+    { "capability": "game_command", "text": "Uses only g_bad_weather_factor, g_set_weather and g_set_skybox to set the weather." },
+    { "capability": "network", "text": "Gets weather reports with HTTPS from tgftp.nws.noaa.gov. The requests contain station identifiers only." },
+    { "capability": "ui_app", "text": "Shows the weather, the approximate place, the stations and the update state." },
+    { "capability": "user_files", "text": "Reads game.log.txt to find your profile, and reads and restores the weather setting in the config.cfg of your profiles." }
+  ],
+  "quality": [],
+  "cleared": [
+    "features/live_weather/src/profile.rs:85: game file reads use UserFiles with declared paths.",
+    "features/live_weather/src/journal.rs:150: the profile repair writes through UserFiles.",
+    "features/live_weather/src/lib.rs:300: the game running check uses LifecycleHost::game_running; process listing is removed.",
+    "features/live_weather/Cargo.toml: runtime dependencies are the SDK, serde and serde_json; dirs and sysinfo are removed."
+  ]
+}

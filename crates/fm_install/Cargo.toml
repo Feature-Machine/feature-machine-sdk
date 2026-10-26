@@ -1,0 +1,29 @@
+[package]
+name = "fm_install"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Install pattern for the app: versioned folders, atomic switch, rollback, signed packages (plan M8)"
+
+[dependencies]
+base64 = "0.22"
+fm_platform = { workspace = true }
+fm_feature_sdk = { workspace = true }
+fm_input = { workspace = true }
+fm_memory = { workspace = true }
+sha2 = { workspace = true }
+minisign-verify = "0.3"
+semver = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
+# Signing only for tests of other crates (feature "testing"): never in the app.
+minisign = { version = "0.7", optional = true }
+
+[features]
+testing = ["dep:minisign"]
+
+[dev-dependencies]
+minisign = "0.7"
+tempfile = "3"

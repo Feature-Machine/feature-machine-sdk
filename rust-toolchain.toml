@@ -1,0 +1,5 @@
+# One Rust version on every machine and in the Linux Docker build, so warnings and results match.
+# Update it on purpose (and the rust image tag in tools/docker/linux-app.Dockerfile with it).
+[toolchain]
+channel = "1.96.0"
+targets = ["aarch64-apple-darwin"]

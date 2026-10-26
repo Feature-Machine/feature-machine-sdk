@@ -1,0 +1,11 @@
+{
+  "id": "trip",
+  "name": "Trip",
+  "version": "0.2.1",
+  "description": "Shows speed, heading, trip distance and moving time for each game session.",
+  "api": 5,
+  "games": ["ats", "msfs2024"],
+  "capabilities": ["vars_read", "ui_app"],
+  "multiplayer": "allowed",
+  "ui": "index.html"
+}

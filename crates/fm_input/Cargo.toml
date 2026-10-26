@@ -1,0 +1,13 @@
+[package]
+name = "fm_input"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Control input engine: elements, bindings, device identity, chords, focus gate and release rule; no OS code"
+
+[dependencies]
+# The control id rule is the feature API's (no host feature, so no OS code comes with it).
+fm_feature_sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

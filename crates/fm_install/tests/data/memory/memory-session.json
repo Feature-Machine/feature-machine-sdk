@@ -1,0 +1,34 @@
+{
+  "kind": "feature-memory-session",
+  "host_version": "0.1.0",
+  "host_api": 5,
+  "manifest": {
+    "id": "memory-fixture",
+    "name": "Memory fixture",
+    "description": "Signed data fixture with no executable library.",
+    "version": "1.0.0",
+    "api": 5,
+    "games": [
+      "msfs2024"
+    ],
+    "capabilities": [
+      "vars_read",
+      "vars_memory"
+    ],
+    "multiplayer": "blocked",
+    "memory_maps": [
+      {
+        "id": "fixture-map",
+        "version": "1.0.0",
+        "sha256": "dfcfb5830d4e8578fbf1e7484d6e1218ed7d41af16c04f930e91b600106e2062"
+      }
+    ]
+  },
+  "files": {
+    "feature.json": "db64ca1b32706443b40b1f8e70b451aeeff0b68fe981defdb99f26a8ee228bfa",
+    "maps/fixture-map/1.0.0/map.json": "dfcfb5830d4e8578fbf1e7484d6e1218ed7d41af16c04f930e91b600106e2062",
+    "maps/fixture-map/1.0.0/map.json.sig": "f3a7947f43a5de9396da7c07099c7a3eed06d05cafd7baf257bc3098f136bd1e",
+    "bin/windows/feature.dll": "baa96d4e556e9423bf767c1e83ea98d09312680ce756b9a5e7726d8b12090b02",
+    "bin/linux/libfeature.so": "baa96d4e556e9423bf767c1e83ea98d09312680ce756b9a5e7726d8b12090b02"
+  }
+}

@@ -1,0 +1,119 @@
+# Feature Machine creator CI (plan docs/plans/2026-10-24-feature-publishing-pipeline.md, L4).
+# Feedback only: the Feature Machine pipeline builds again from the reviewed commit and never
+# uses this output. It runs fm_pack build of the pushed commit with the fm_pack of the SDK commit
+# in the creator's Cargo.lock (the build that we do), then cargo test and cargo clippy.
+# It goes to the public SDK repository as .github/workflows/feature-machine.yml; creators call it.
+name: Feature Machine
+
+on:
+  workflow_call:
+    inputs:
+      feature-dir:
+        description: Folder of the feature (feature.json and Cargo.toml), relative to the repository root.
+        type: string
+        default: "."
+
+permissions:
+  contents: read
+
+env:
+  # The public SDK repository. Placeholder: the repository does not exist yet (plan L4).
+  FM_SDK_REPOSITORY: parallel42/feature-machine-sdk
+
+jobs:
+  feature:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the feature
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: creator
+          persist-credentials: false
+
+      # The SDK that the feature links must be the git dependency on the public SDK repository
+      # at a release tag; our build checks the same. cargo tree decides which SDK (features of this
+      # package only, as cargo build; no dev- or build-dependencies); its short commit gives the
+      # full source in cargo metadata. That commit gives the fm_pack that builds the feature.
+      - name: Find the SDK commit
+        id: sdk
+        shell: pwsh
+        env:
+          FEATURE_DIR: ${{ inputs.feature-dir }}
+        run: |
+          $manifest = (Resolve-Path "creator/$env:FEATURE_DIR/Cargo.toml").Path
+          $tree = cargo tree --locked -e normal --target x86_64-pc-windows-msvc --prefix depth -f '{p}' --manifest-path $manifest | Out-String
+          if ($LASTEXITCODE -ne 0) { "::error::cargo tree --locked failed: commit an up-to-date Cargo.lock."; exit 1 }
+          $sdks = @($tree -split "`r?`n" | Where-Object { $_ -match '^[1-9][0-9]*fm_feature_sdk v' } | ForEach-Object { ($_ -replace '^[0-9]+', '') -replace ' \(\*\)$', '' } | Sort-Object -Unique)
+          if ($sdks.Count -ne 1) { "::error::The feature must link one fm_feature_sdk (found $($sdks.Count))."; exit 1 }
+          $source = $sdks[0]
+          $shown = [regex]::Match($source, '^fm_feature_sdk v\S+ \((.+://.+)#([0-9a-f]+)\)$')
+          if ($shown.Success) {
+            $json = cargo metadata --locked --format-version 1 --manifest-path $manifest | Out-String
+            if ($LASTEXITCODE -ne 0) { "::error::cargo metadata --locked failed: commit an up-to-date Cargo.lock."; exit 1 }
+            $prefix = "git+$($shown.Groups[1].Value)#$($shown.Groups[2].Value)"
+            $full = @(($json | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'fm_feature_sdk' -and "$($_.source)".StartsWith($prefix, [StringComparison]::Ordinal) })
+            if ($full.Count -ne 1) { "::error::cargo metadata has no single source for $source."; exit 1 }
+            $source = $full[0].source
+          }
+          $m = [regex]::Match([string]$source, '^git\+https://github\.com/([^?#]+?)(?:\.git)?\?(?:[^#]*&)?tag=[^&#]+[^#]*#([0-9a-f]{40})$')
+          if (-not $m.Success) { "::error file=Cargo.toml::fm_feature_sdk must be the git dependency on https://github.com/$env:FM_SDK_REPOSITORY with a release tag (tag = `"...`"), not $source."; exit 1 }
+          if ($m.Groups[1].Value -ne $env:FM_SDK_REPOSITORY) { "::error file=Cargo.toml::fm_feature_sdk comes from $($m.Groups[1].Value), not from $env:FM_SDK_REPOSITORY."; exit 1 }
+          "commit=$($m.Groups[2].Value)" >> $env:GITHUB_OUTPUT
+
+      - name: Check out the SDK
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FM_SDK_REPOSITORY }}
+          ref: ${{ steps.sdk.outputs.commit }}
+          path: fm-sdk
+          persist-credentials: false
+
+      # The compiler of the SDK's rust-toolchain.toml, also for the tests and the lint (fm_pack
+      # build forces it too), so the creator sees the warnings and results of our build.
+      - name: Install the pinned Rust
+        shell: pwsh
+        run: |
+          $m = [regex]::Match((Get-Content -Raw fm-sdk/rust-toolchain.toml), '(?m)^channel\s*=\s*"([^"]+)"')
+          if (-not $m.Success) { "::error::The SDK has no Rust channel in rust-toolchain.toml."; exit 1 }
+          rustup toolchain install $m.Groups[1].Value --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "RUSTUP_TOOLCHAIN=$($m.Groups[1].Value)" >> $env:GITHUB_ENV
+
+      - name: Build fm_pack
+        working-directory: fm-sdk
+        run: cargo build --release --locked -p fm_pack
+
+      # The package and build.json go to RUNNER_TEMP, outside both checkouts, so no cargo
+      # config of a parent folder applies. The work folder is removed; it is large.
+      - name: fm_pack build (the Feature Machine build)
+        id: build
+        shell: pwsh
+        env:
+          FEATURE_DIR: ${{ inputs.feature-dir }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP fm-out
+          & fm-sdk/target/release/fm_pack.exe build creator $env:GITHUB_SHA $env:FEATURE_DIR $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item -Recurse -Force (Join-Path $out work)
+
+      # After a successful build, the tests, the lint and the upload run even when one of them
+      # fails, so the creator gets every result and the package in one run.
+      - name: cargo test
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: creator/${{ inputs.feature-dir }}
+        run: cargo test --locked
+
+      - name: cargo clippy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: creator/${{ inputs.feature-dir }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Keep the package and build.json
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: feature-machine-package
+          path: ${{ runner.temp }}/fm-out/
+          retention-days: 7
+          if-no-files-found: error

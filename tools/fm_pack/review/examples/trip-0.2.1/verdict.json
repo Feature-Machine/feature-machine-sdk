@@ -1,0 +1,27 @@
+{
+  "feature": { "id": "trip", "version": "0.2.1" },
+  "verdict": "approve",
+  "reason": "The source uses only declared powers and standard SDK logging. No malicious code, data theft, hidden network use or sandbox escape was found.",
+  "findings": [],
+  "powers": [
+    { "power": "vars_read", "declared": "yes", "used": "speed, heading, position, pause, brake, engine", "matches": true },
+    { "power": "ui_app", "declared": "index.html", "used": "state messages and local HTML, JavaScript and CSS", "matches": true },
+    { "power": "network", "declared": "none", "used": "none", "matches": true },
+    { "power": "controls and input injection", "declared": "none", "used": "none", "matches": true },
+    { "power": "game commands", "declared": "none", "used": "none", "matches": true },
+    { "power": "memory maps and writes", "declared": "none", "used": "none", "matches": true },
+    { "power": "direct file, process or registry access", "declared": "none", "used": "none", "matches": true }
+  ],
+  "brief": [
+    { "capability": "vars_read", "text": "Reads speed, heading, position, pause, brake and engine state to count trip distance and moving time." },
+    { "capability": "ui_app", "text": "Shows speed, heading, trip distance and moving time on its page in the app." }
+  ],
+  "quality": [
+    "features/trip/src/lib.rs:97: path distance accepts steps below 200 meters across long gaps, while speed distance rejects gaps above 0.5 seconds, so the totals can disagree.",
+    "features/trip/src/lib.rs:92: a speed value that is not finite can corrupt the trip total until a restart."
+  ],
+  "cleared": [
+    "The unsafe call at features/trip/src/lib.rs:197 is test code only.",
+    "Frame work has no unbounded loop or growing collection; page updates are at 4 Hz."
+  ]
+}

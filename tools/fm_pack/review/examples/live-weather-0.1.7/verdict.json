@@ -1,0 +1,30 @@
+{
+  "feature": { "id": "live-weather", "version": "0.1.7" },
+  "verdict": "deny",
+  "reason": "The feature reads and writes game files and lists processes outside the SDK. Its feature.json does not declare these powers.",
+  "findings": [
+    { "severity": "high", "file": "features/live_weather/src/profile.rs", "line": 110, "power": "direct file access", "declared": false, "what": "Reads the game log with std::fs.", "why": "File access outside the SDK is not allowed, and game_command does not grant it." },
+    { "severity": "high", "file": "features/live_weather/src/hold.rs", "line": 133, "power": "direct file access", "declared": false, "what": "Reads the profile config.cfg with std::fs.", "why": "File access outside the SDK is not allowed." },
+    { "severity": "high", "file": "features/live_weather/src/journal.rs", "line": 136, "power": "direct file access", "declared": false, "what": "Replaces config.cfg files during the lifecycle repair, with journal paths that are not checked for containment.", "why": "Writes to game files outside the SDK can damage member data." },
+    { "severity": "medium", "file": "features/live_weather/src/lib.rs", "line": 93, "power": "process access", "declared": false, "what": "Lists the system processes and reads their details with sysinfo.", "why": "Process access outside the SDK is not allowed, whatever the purpose." }
+  ],
+  "powers": [
+    { "power": "vars_read", "declared": "yes", "used": "truck position, pause state", "matches": true },
+    { "power": "game_command", "declared": "g_bad_weather_factor, g_set_weather, g_set_skybox", "used": "those three commands through the SDK", "matches": true },
+    { "power": "network", "declared": "tgftp.nws.noaa.gov", "used": "HTTPS GET of station reports through the app", "matches": true },
+    { "power": "ui_app", "declared": "index.html", "used": "state messages, sandboxed page", "matches": true },
+    { "power": "direct file access", "declared": "none", "used": "game log and profile config.cfg, read and write", "matches": false },
+    { "power": "process access", "declared": "none", "used": "process list and start time", "matches": false },
+    { "power": "feature data folder", "declared": "SDK data folder", "used": "repair journal", "matches": true }
+  ],
+  "brief": [],
+  "quality": [
+    "features/live_weather/src/profile.rs:117 reads all new log bytes without a size limit.",
+    "features/live_weather/src/metar.rs:248 can panic when a cloud token that is not ASCII crosses the byte split."
+  ],
+  "cleared": [
+    "Redirects stay on the declared host.",
+    "The page uses textContent and makes no network call.",
+    "No obfuscation, data theft, registry access or custom unsafe code in shipped code."
+  ]
+}

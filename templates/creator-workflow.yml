@@ -1,0 +1,22 @@
+# Feature Machine feedback for this feature: the Feature Machine build of each push and pull
+# request, then the tests and the lint. Copy this file to .github/workflows/feature-machine.yml
+# of the feature repository. Use the release tag of the fm_feature_sdk dependency in Cargo.toml.
+# The result is for you only: Feature Machine builds again from the commit that it reviews.
+name: Feature Machine
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feature-machine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  feature:
+    uses: parallel42/feature-machine-sdk/.github/workflows/feature-machine.yml@v0.1.0
+    with:
+      feature-dir: "."

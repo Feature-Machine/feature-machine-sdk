@@ -1,0 +1,48 @@
+{
+    "compiler":  {
+                     "tool":  "dxc 1.8.2502.11 (Windows SDK 10.0.26100.0)",
+                     "hashes":  {
+                                    "dxc.exe":  "7c6918a0e2d4e437629fa8549f5ce800970494780f363bbbe1e3d3034f435aee",
+                                    "dxcompiler.dll":  "78b5e21a91707b4a567ef281a519c52a45b709561202f54c5ad79c5a315847ed",
+                                    "dxil.dll":  "77e039c905030a641e53658a008b74e90635a5ea9b6b79eabd0f2003bdfca59a"
+                                }
+                 },
+    "sources":  {
+                    "fullscreen.hlsl":  {
+                                            "sha256":  "578bccca02fbb4e58e693e702ac26a2099b406c8e822937839c959fbeca7afff",
+                                            "outputs":  {
+                                                            "fullscreen.vs.cso":  {
+                                                                                      "entry":  "main",
+                                                                                      "profile":  "vs_6_0",
+                                                                                      "sha256":  "9d698d07cba5e19ab3ebd45104f57e0b1927bfcd1e036d6a32f15ca3b16e410a"
+                                                                                  }
+                                                        }
+                                        },
+                    "color.hlsl":  {
+                                       "sha256":  "477f42d019a1c80d6090cdff04637ec2cd55d4235aa01f75605617b52e54cfd8",
+                                       "outputs":  {
+                                                       "color.ps.cso":  {
+                                                                            "entry":  "main",
+                                                                            "profile":  "ps_6_0",
+                                                                            "sha256":  "ab955eaa6a7393b9a6d87d01942cb3e390810552b71b4fc84547f12f1010ae1c"
+                                                                        }
+                                                   }
+                                   },
+                    "mirage.hlsl":  {
+                                        "sha256":  "556440a1b88c62c597b48d9bf3b3a7d867c2b356752b7afc6c1246637460ff1b",
+                                        "outputs":  {
+                                                        "mirage.ps.cso":  {
+                                                                              "entry":  "main",
+                                                                              "profile":  "ps_6_0",
+                                                                              "sha256":  "cc212208089c4144fb03d5d0546d34e2952c5f52205ec97234bb2346e8796675"
+                                                                          }
+                                                    }
+                                    },
+                    "fm_shader.hlsli":  {
+                                            "sha256":  "4d37601b9db08179e8db3b7accf223d6dbbf3d42636d3c8f7ff2935dd2fd9f40",
+                                            "outputs":  {
+
+                                                        }
+                                        }
+                }
+}

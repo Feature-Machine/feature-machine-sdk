@@ -1,0 +1,23 @@
+{
+  "kind": "memory-map",
+  "contract": "anchored-scalar-v1",
+  "map": {
+    "schema": 1,
+    "id": "fixture-map",
+    "version": "1.0.0",
+    "game": "msfs2024",
+    "module": "fixture.exe",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "symbols": [
+      {
+        "name": "scalar",
+        "pattern": "46 4D 5F 56 41 4C 55 45",
+        "offset": 8,
+        "kind": "f32",
+        "access": "read",
+        "min": 0,
+        "max": 10
+      }
+    ]
+  }
+}

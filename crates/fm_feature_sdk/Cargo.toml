@@ -1,0 +1,25 @@
+[package]
+name = "fm_feature_sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Feature API: the C ABI between our in-game hosts and feature libraries, the Rust side for features (feature! macro) and the loader for hosts"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libloading = { version = "0.8", optional = true }
+# The default user folder of a game (files.rs, host side only).
+dirs = { workspace = true, optional = true }
+
+[features]
+# The loaders: our in-game hosts (ATS plugin, MSFS host), the test host and the lifecycle helper
+# (fm_feature_hook).
+host = ["dep:libloading", "dep:dirs"]
+# testing::DirFiles for feature tests (dev-dependencies only; a shipped feature never needs it).
+testing = ["host"]
+
+[dev-dependencies]
+fm_memory = { workspace = true }
+tempfile = "3"

@@ -1,0 +1,11 @@
+# One line ending (LF) in the repo and in every checkout, so scripts and the Linux Docker build
+# see the same files as Windows. Binary files are detected and left alone.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.icns binary
+# Signed test fixtures: the signature covers the exact bytes, so no line-ending conversion.
+crates/fm_install/tests/data/memory/** binary
+features/*/maps/** binary
+# Compiled shaders: the manifest test hashes the exact bytes (crates/fm_render/shaders).
+crates/fm_render/shaders/*.cso binary

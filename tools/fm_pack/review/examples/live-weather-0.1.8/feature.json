@@ -1,0 +1,19 @@
+{
+  "id": "live-weather",
+  "name": "Live weather",
+  "version": "0.1.8",
+  "description": "The weather in American Truck Simulator follows the real weather at the place of your truck, from NOAA National Weather Service reports (not endorsed by NOAA or the NWS).",
+  "api": 5,
+  "games": ["ats"],
+  "capabilities": ["vars_read", "game_command", "network", "ui_app", "user_files"],
+  "multiplayer": "blocked",
+  "multiplayer_note": "Changes the weather of the game, which TruckersMP does not allow.",
+  "ui": "index.html",
+  "game_commands": ["g_bad_weather_factor", "g_set_weather", "g_set_skybox"],
+  "network_hosts": ["tgftp.nws.noaa.gov"],
+  "user_files": [
+    { "game": "ats", "path": "game.log.txt", "access": "read" },
+    { "game": "ats", "path": "profiles/*/config.cfg", "access": "write" },
+    { "game": "ats", "path": "steam_profiles/*/config.cfg", "access": "write" }
+  ]
+}

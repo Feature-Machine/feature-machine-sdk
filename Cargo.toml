@@ -1,0 +1,35 @@
+# Feature Machine SDK workspace, exported from the Feature Machine client repository.
+# fm_feature_sdk is the crate that features link; fm_pack builds feature packages.
+[workspace]
+resolver = "2"
+members = [
+    "crates/fm_feature_sdk",
+    "crates/fm_input",
+    "crates/fm_install",
+    "crates/fm_memory",
+    "crates/fm_paths",
+    "crates/fm_platform",
+    "tools/fm_pack",
+]
+
+[workspace.dependencies]
+dirs = "6"
+dunce = "1.0.5"
+fm_feature_sdk = { path = "crates/fm_feature_sdk" }
+fm_input = { path = "crates/fm_input" }
+fm_install = { path = "crates/fm_install" }
+fm_memory = { path = "crates/fm_memory" }
+fm_paths = { path = "crates/fm_paths" }
+fm_platform = { path = "crates/fm_platform" }
+schemars = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+steamlocate = "2.1.1"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+windows-sys = { version = "0.61.2" }
+
+[profile.release]
+# Unwind (not abort) so plugin callbacks can catch a panic and keep the game alive.
+panic = "unwind"
+codegen-units = 1

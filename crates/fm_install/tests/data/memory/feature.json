@@ -1,0 +1,22 @@
+{
+  "id": "memory-fixture",
+  "name": "Memory fixture",
+  "description": "Signed data fixture with no executable library.",
+  "version": "1.0.0",
+  "api": 5,
+  "games": [
+    "msfs2024"
+  ],
+  "capabilities": [
+    "vars_read",
+    "vars_memory"
+  ],
+  "multiplayer": "blocked",
+  "memory_maps": [
+    {
+      "id": "fixture-map",
+      "version": "1.0.0",
+      "sha256": "dfcfb5830d4e8578fbf1e7484d6e1218ed7d41af16c04f930e91b600106e2062"
+    }
+  ]
+}
