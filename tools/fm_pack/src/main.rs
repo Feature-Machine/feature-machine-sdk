@@ -19,12 +19,13 @@ fn main() -> ExitCode {
         ["build", repo, commit, dir, out] => build::command(repo, commit, dir, out),
         ["review-brief", dir, verdict] => review::command(dir, verdict),
         ["shaders", dir, out] => shaders::write(std::path::Path::new(dir), std::path::Path::new(out)),
+        ["dxc"] => shaders::compiler().map(|p| println!("{}", p.display())),
         ["catalog", feed, zip] => catalog(feed, zip),
         ["inspect", zip] => inspect(zip),
         ["withdraw", feed, id, version] => withdraw(feed, id, version),
         ["memory-session", dir, libs @ ..] if !libs.is_empty() => memory_session(dir, libs),
         ["map", rest @ ..] => map::command(rest),
-        _ => Err(format!("usage: fm_pack zip <dir> <out.zip> | fm_pack setup <stub> <zip> <sig> <version> <out> | fm_pack feature <dir> <out.zip> <library>... | fm_pack build <repo> <commit> <feature dir> <out dir> | fm_pack review-brief <build dir> <verdict.json> | fm_pack shaders <dir> <out dir> | fm_pack catalog <feed> <zip> (needs <zip>.sig) | fm_pack inspect <zip> | fm_pack withdraw <feed> <id> <version> | {}", map::USAGE)),
+        _ => Err(format!("usage: fm_pack zip <dir> <out.zip> | fm_pack setup <stub> <zip> <sig> <version> <out> | fm_pack feature <dir> <out.zip> <library>... | fm_pack build <repo> <commit> <feature dir> <out dir> | fm_pack review-brief <build dir> <verdict.json> | fm_pack shaders <dir> <out dir> | fm_pack dxc (path of the pinned compiler) | fm_pack catalog <feed> <zip> (needs <zip>.sig) | fm_pack inspect <zip> | fm_pack withdraw <feed> <id> <version> | {}", map::USAGE)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

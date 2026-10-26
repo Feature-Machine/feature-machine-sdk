@@ -6,21 +6,73 @@
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 
-const BIN: &str = r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64";
 const MANIFEST: &str = include_str!("../../../crates/fm_render/shaders/manifest.json");
 const CONTRACT: &str = include_str!("../../../crates/fm_render/shaders/fm_shader.hlsli");
+// The Windows tools, by full path: Git's tar reads "C:\..." as a remote host.
+const CURL: &str = r"C:\Windows\System32\curl.exe";
+const TAR: &str = r"C:\Windows\System32\tar.exe";
 
-/// The compiler, after its files match the pinned hashes.
-fn compiler() -> Result<PathBuf, String> {
+fn sha256(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The pinned compiler: the official DirectXShaderCompiler release in fm_render's manifest.json
+/// (zip URL, zip SHA-256, file hashes). A Windows SDK copy differs between build computers (the
+/// GitHub runner, 2026-10-26), the release does not. The first call downloads and checks the zip
+/// into %LOCALAPPDATA%\fm_pack; each call checks the files again before use.
+pub fn compiler() -> Result<PathBuf, String> {
     let m: serde_json::Value = serde_json::from_str(MANIFEST).map_err(|e| e.to_string())?;
-    let hashes = m["compiler"]["hashes"].as_object().ok_or("fm_render manifest.json has no compiler hashes")?;
+    let c = &m["compiler"];
+    let (url, zip_sha) = (c["url"].as_str(), c["sha256"].as_str());
+    let (Some(url), Some(zip_sha), Some(hashes)) = (url, zip_sha, c["hashes"].as_object()) else {
+        return Err("fm_render manifest.json has no compiler url, sha256 and hashes".into());
+    };
+    let cache = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or("LOCALAPPDATA is not set")?.join("fm_pack");
+    let dir = cache.join(format!("dxc-{}", &zip_sha[..16.min(zip_sha.len())]));
+    let bin = dir.join("bin").join("x64");
+    if dir.exists() && pinned(&bin, hashes).is_err() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    if !dir.exists() { fetch(url, zip_sha, &cache, &dir)?; }
+    pinned(&bin, hashes)?;
+    Ok(bin.join("dxc.exe"))
+}
+
+/// Ok when each pinned file in `bin` has its pinned SHA-256.
+fn pinned(bin: &Path, hashes: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
     for (file, want) in hashes {
-        let path = Path::new(BIN).join(file);
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e} (install Windows SDK 10.0.26100.0)", path.display()))?;
-        let got: String = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        let path = bin.join(file);
+        let got = sha256(&std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?);
         if Some(got.as_str()) != want.as_str() { return Err(format!("{} is not the pinned compiler ({got})", path.display())); }
     }
-    Ok(Path::new(BIN).join("dxc.exe"))
+    Ok(())
+}
+
+/// Downloads the release zip, checks its SHA-256, unpacks it in a folder of this process, then
+/// renames that folder to `dir` (one step, so a parallel fm_pack never sees half a compiler).
+fn fetch(url: &str, want: &str, cache: &Path, dir: &Path) -> Result<(), String> {
+    let work = cache.join(format!("download-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(work.join("x")).map_err(|e| format!("{}: {e}", work.display()))?;
+    let zip = work.join("dxc.zip");
+    let result = (|| {
+        let run = |cmd: &mut std::process::Command| match cmd.output() {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(format!("{:?} failed: {}", cmd, String::from_utf8_lossy(&o.stderr))),
+            Err(e) => Err(format!("{:?}: {e}", cmd)),
+        };
+        run(std::process::Command::new(CURL).args(["-fsSL", "--retry", "3", "-o"]).arg(&zip).arg(url))?;
+        let got = sha256(&std::fs::read(&zip).map_err(|e| format!("{}: {e}", zip.display()))?);
+        if got != want { return Err(format!("{url} has SHA-256 {got}, not the pinned {want}")); }
+        run(std::process::Command::new(TAR).arg("-x").arg("-f").arg(&zip).current_dir(work.join("x")))?;
+        // Another fm_pack can rename first: then its folder is the compiler, and pinned() checks it.
+        if std::fs::rename(work.join("x"), dir).is_err() && !dir.exists() {
+            return Err(format!("{}: cannot place the compiler", dir.display()));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result
 }
 
 /// The compiled shaders of `dir`/shaders in name order: none when the folder does not exist.
@@ -78,6 +130,23 @@ pub fn write(dir: &Path, out: &Path) -> Result<(), String> {
 mod tests {
     const GOOD: &str = "#include \"fm_shader.hlsli\"\n#include \"common.hlsli\"\n[RootSignature(FM_RS)] float4 main(FmPixel i) : SV_Target { return half_of(fm_color.Sample(fm_point, i.uv)); }\n";
 
+    // A changed or missing compiler file is refused, so a damaged cache is downloaded again.
+    #[test]
+    fn a_compiler_file_with_another_hash_is_refused() {
+        let dir = std::env::temp_dir().join(format!("fm-pack-dxc-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dxc.exe"), b"good").unwrap();
+        let mut hashes = serde_json::Map::new();
+        hashes.insert("dxc.exe".into(), super::sha256(b"good").into());
+        assert!(super::pinned(&dir, &hashes).is_ok());
+        std::fs::write(dir.join("dxc.exe"), b"bad").unwrap();
+        assert!(super::pinned(&dir, &hashes).unwrap_err().contains("is not the pinned compiler"));
+        hashes.insert("dxil.dll".into(), super::sha256(b"x").into());
+        std::fs::write(dir.join("dxc.exe"), b"good").unwrap();
+        assert!(super::pinned(&dir, &hashes).is_err(), "a missing file is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // A bad file name stops before the compiler, so this runs on every system.
     #[test]
     fn a_bad_shader_name_stops_before_the_compiler() {
@@ -90,7 +159,8 @@ mod tests {
     }
 
     // A contract shader compiles to a DXBC container; a broken one stops with dxc's message. The
-    // pinned compiler is the Windows SDK's dxc.exe, so this runs on Windows only.
+    // pinned compiler is the Windows build of the dxc release (downloaded once), so this runs on
+    // Windows only.
     #[cfg(windows)]
     #[test]
     fn feature_shaders_compile_with_the_pinned_compiler() {

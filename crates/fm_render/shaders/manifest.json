@@ -1,10 +1,12 @@
 {
     "compiler":  {
-                     "tool":  "dxc 1.8.2502.11 (Windows SDK 10.0.26100.0)",
+                     "tool":  "dxc 1.8.2502.8 (DirectXShaderCompiler release v1.8.2502)",
+                     "url":  "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2502/dxc_2025_02_20.zip",
+                     "sha256":  "70b1913a1bfce4a3e1a5311d16246f4ecdf3a3e613abec8aa529e57668426f85",
                      "hashes":  {
-                                    "dxc.exe":  "7c6918a0e2d4e437629fa8549f5ce800970494780f363bbbe1e3d3034f435aee",
-                                    "dxcompiler.dll":  "78b5e21a91707b4a567ef281a519c52a45b709561202f54c5ad79c5a315847ed",
-                                    "dxil.dll":  "77e039c905030a641e53658a008b74e90635a5ea9b6b79eabd0f2003bdfca59a"
+                                    "dxc.exe":  "ae4bf100b8c64ab03cdc0ee5996d5f212e96c59d6d37340359342d714ac6c004",
+                                    "dxcompiler.dll":  "f79943b02f73b621421b58a569fd6ee120d0023fb6bfa23844ecad6b00d6a295",
+                                    "dxil.dll":  "62736e99aa534a942873f92b881a71b2cb6ad62b8d7481ea7a8ad8e9888a8056"
                                 }
                  },
     "sources":  {
@@ -14,7 +16,7 @@
                                                             "fullscreen.vs.cso":  {
                                                                                       "entry":  "main",
                                                                                       "profile":  "vs_6_0",
-                                                                                      "sha256":  "9d698d07cba5e19ab3ebd45104f57e0b1927bfcd1e036d6a32f15ca3b16e410a"
+                                                                                      "sha256":  "5965151f35a848f346213138d5a0ef2dc25d2c94baa5da556c77a122a1ea428c"
                                                                                   }
                                                         }
                                         },
@@ -24,7 +26,7 @@
                                                        "color.ps.cso":  {
                                                                             "entry":  "main",
                                                                             "profile":  "ps_6_0",
-                                                                            "sha256":  "ab955eaa6a7393b9a6d87d01942cb3e390810552b71b4fc84547f12f1010ae1c"
+                                                                            "sha256":  "7346f831b400f0435f1c656162a090ebf7e595106ffb30eab9f328ee1c90f55e"
                                                                         }
                                                    }
                                    },
@@ -34,7 +36,7 @@
                                                         "mirage.ps.cso":  {
                                                                               "entry":  "main",
                                                                               "profile":  "ps_6_0",
-                                                                              "sha256":  "cc212208089c4144fb03d5d0546d34e2952c5f52205ec97234bb2346e8796675"
+                                                                              "sha256":  "6a2067b772080e7274dbddf5ecc6db1a8d4c5ff3013d0661991bfdbcb9db4e2d"
                                                                           }
                                                     }
                                     },
