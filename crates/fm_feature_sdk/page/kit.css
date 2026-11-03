@@ -1,0 +1,65 @@
+/* Feature Machine page kit, version 1 (feature surfaces plan, section 6, FS2). The app serves it
+   at <page base>_fm/1/kit.css. The colors are the app theme: page.js sets the --fm-* variables
+   from the app; the values here are the dark theme for a page that is not in the app yet. Text
+   uses the sans font; numbers use tabular digits so they align (no monospace for words). */
+:root {
+  --fm-bg: #000;
+  --fm-tile: #111;
+  --fm-tile-2: #181818;
+  --fm-line: #232323;
+  --fm-line-hi: #333;
+  --fm-text: #f2f2f2;
+  --fm-dim: #8c8c8c;
+  --fm-faint: #5c5c5c;
+  --fm-accent: #e6261f;
+  --fm-ok: #7fd69a;
+  --fm-warn: #ffd27a;
+  --fm-bad: #ff8a80;
+  --fm-sans: "Segoe UI", system-ui, sans-serif;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--fm-bg); color: var(--fm-text); font: 14px/1.45 var(--fm-sans); }
+body { padding: 24px; }
+h1, h2, h3 { margin: 0 0 8px; font-weight: 600; }
+h1 { font-size: 22px; }
+h2 { font-size: 17px; }
+h3 { font-size: 15px; }
+p { margin: 0 0 8px; }
+button, input, select { font: inherit; color: inherit; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--fm-text); outline-offset: 2px; }
+
+.fm-muted { color: var(--fm-dim); }
+.fm-error { color: var(--fm-bad); }
+.fm-num { font-variant-numeric: tabular-nums; }
+
+/* A card: one block of the page. */
+.fm-card { background: var(--fm-tile); border: 1px solid var(--fm-line); border-radius: 14px; padding: 16px; margin: 0 0 12px; }
+.fm-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 12px; }
+.fm-card > header h2, .fm-card > header h3 { margin: 0; }
+.fm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
+
+/* A state badge: running, idle, warn, bad. */
+.fm-badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; background: var(--fm-tile-2); color: var(--fm-dim); }
+.fm-badge.running { color: var(--fm-ok); }
+.fm-badge.warn { color: var(--fm-warn); }
+.fm-badge.bad { color: var(--fm-bad); }
+
+/* fm-stat: a label over a value and its unit. */
+fm-stat { display: flex; flex-direction: column; gap: 2px; }
+fm-stat .fm-label { font-size: 12px; color: var(--fm-dim); }
+fm-stat .fm-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+fm-stat .fm-unit { font-size: 13px; color: var(--fm-dim); margin-left: 4px; font-weight: 400; }
+
+/* fm-toggle and fm-range: a setting of the feature, written through the app. */
+fm-toggle, fm-range { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 0; }
+fm-toggle .fm-switch { position: relative; width: 40px; height: 24px; border-radius: 999px; background: var(--fm-line-hi); border: 0; padding: 0; cursor: pointer; flex: none; }
+fm-toggle .fm-switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--fm-text); transition: transform 0.15s; }
+fm-toggle .fm-switch[aria-checked="true"] { background: var(--fm-accent); }
+fm-toggle .fm-switch[aria-checked="true"]::after { transform: translateX(16px); }
+fm-toggle .fm-switch:disabled, fm-range input:disabled { opacity: 0.5; cursor: default; }
+fm-range .fm-control { display: flex; align-items: center; gap: 10px; }
+fm-range input[type="range"] { width: 180px; accent-color: var(--fm-accent); }
+fm-range output { min-width: 3em; text-align: right; font-variant-numeric: tabular-nums; }
+fm-toggle .fm-error, fm-range .fm-error { font-size: 12px; }

@@ -25,5 +25,6 @@
     "features/live_weather/src/journal.rs:150: the profile repair writes through UserFiles.",
     "features/live_weather/src/lib.rs:300: the game running check uses LifecycleHost::game_running; process listing is removed.",
     "features/live_weather/Cargo.toml: runtime dependencies are the SDK, serde and serde_json; dirs and sysinfo are removed."
-  ]
+  ],
+  "dependencies": []
 }

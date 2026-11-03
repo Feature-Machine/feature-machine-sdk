@@ -15,6 +15,13 @@ pub const FILE: &str = "active.json";
 #[serde(deny_unknown_fields)]
 pub struct MapDependency { pub id: String, pub version: String, pub sha256: String }
 
+/// A map that a feature needs from a module (module layer plan 8.1): an interface (a camera
+/// contract name), a semver range of that interface, and the map id. The feature names no
+/// module; the app's lock selects the provider and the host reads the map from it only. No
+/// deny_unknown_fields: a later field must not make older apps refuse a whole catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Requirement { pub interface: String, pub versions: String, pub map: String }
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActiveFeature {
     pub id: String,
@@ -40,6 +47,23 @@ pub struct ActiveFeature {
     /// The game files that the feature may read or change (capability user_files, files.rs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_files: Vec<crate::UserFile>,
+    /// Maps from modules (Requirement). The host takes them from the session lock only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Requirement>,
+    /// The feature's settings file (crate::settings): a path, not the values, so a restart that
+    /// clones this record still reads the current values. None: no settings, or an older app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<PathBuf>,
+}
+
+impl ActiveFeature {
+    /// True when the feature reads maps: pinned in its package or required from a module.
+    pub fn uses_maps(&self) -> bool { !self.memory_maps.is_empty() || !self.requires.is_empty() }
+    /// The ids of every map that the feature may use with `mem:` keys: its own pins and the maps
+    /// that it requires from modules (ground wetness plan: a writer has only module maps).
+    pub fn map_ids(&self) -> impl Iterator<Item = &str> {
+        self.memory_maps.iter().map(|m| m.id.as_str()).chain(self.requires.iter().map(|r| r.map.as_str()))
+    }
 }
 
 /// The data folder of feature `id`: <features dir>/<id>/data, next to its versions/ folder. The
@@ -97,6 +121,16 @@ pub enum PassState {
     Failed,
 }
 
+/// One start of a feature in one host (feature surfaces plan, section 4): the host instance
+/// (Hello.instance) and the activation (FeatureStatus.activation). A widget action names the
+/// start that its widget showed, so a restart while the action waits cannot give it to the next
+/// start; the host checks it just before the dispatch (FeatureSet::app_message).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageTarget {
+    pub instance: u64,
+    pub activation: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FeatureStatus {
     pub id: String,
@@ -112,6 +146,11 @@ pub struct FeatureStatus {
     /// never shows (session sync plan 12.2). None: a host from before slice 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<u64>,
+    /// The settings revision that this activation runs (feature surfaces plan, section 3): from
+    /// the file at its start, then from each update that it got. The app shows "Applied" only
+    /// when it is the current revision. None: not a version 6 feature that runs, or an older host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_revision: Option<u64>,
 }
 
 /// What a host reports after each change: its features and the multiplayer check.
@@ -128,6 +167,11 @@ pub struct HostReport {
     /// Empty: an older host, or no feature installed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_versions: BTreeMap<String, String>,
+    /// The user folder of the game when it is not the default (an ATS -homedir start). The app
+    /// keeps it in the session record and gives it to the exit hook, which cannot see the game
+    /// arguments. None: the default folder, no user folder, or an older host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

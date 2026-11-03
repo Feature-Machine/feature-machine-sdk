@@ -13,7 +13,9 @@ pub mod testing;
 pub mod follow;
 #[cfg(feature = "host")]
 pub mod host;
+pub mod page;
 pub mod render;
+pub mod settings;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -82,6 +84,21 @@ pub enum Capability {
     /// The game files in the feature's "user_files" list, read or changed through UserFiles
     /// (version 5): files the game keeps in its user folder (ATS: game.log.txt, profiles).
     UserFiles,
+    /// Direct powers (submission review plan R1, R2): the feature calls the operating system
+    /// itself, not an SDK service, so no host can limit the call. The review checks the shipped
+    /// code end to end, and consent names each power. They grant nothing in the hosts; an older
+    /// app reads them as Unknown and refuses the feature.
+    /// Files on the PC outside its data folder, without the user_files service.
+    DirectFiles,
+    /// Other processes: list them, read them or control them.
+    DirectProcesses,
+    /// The Windows registry.
+    DirectRegistry,
+    /// Network connections that the feature makes itself, not through Host::http_get.
+    DirectNetwork,
+    /// Other code at run time: a library that it loads (from its package or the PC) or a
+    /// program that it starts.
+    LoadCode,
     /// Any name that this build does not know (newer, or removed like "keys_read"). It makes
     /// only that feature fail: the manifest check and the host refuse it, while the other
     /// features of the same catalog or active.json still load (an unknown name in a strict
@@ -305,6 +322,10 @@ pub fn valid_control_id(id: &str) -> bool {
 /// The most hosts that a feature can declare in network_hosts.
 pub const MAX_NETWORK_HOSTS: usize = 8;
 
+/// The page message topic of Host::settings_import. Topics with the "fm:" prefix are the app's:
+/// the app takes this one and never gives an "fm:" topic of a feature to a page or a widget.
+pub const SETTINGS_IMPORT_TOPIC: &str = "fm:settings_import";
+
 /// A host name for network_hosts: a lower-case DNS name with two labels or more (no scheme,
 /// port, wildcard, IP address or "localhost"), so the consent line names one exact server
 /// group. One rule for the manifest check (fm_install) and the hosts.
@@ -432,6 +453,32 @@ impl UserFiles for FileCalls {
     fn file_write(&self, key: &str, bytes: &[u8]) -> Result<(), HostError> {
         result(unsafe { (self.write)(self.ctx, key.as_ptr(), key.len(), bytes.as_ptr(), bytes.len()) })
     }
+}
+
+/// The feature's settings (feature.json "settings", API 6): the member's values for this
+/// version by setting id, and their revision. A typed read gives None for a missing id or another
+/// type, so the feature keeps its own default. Host::settings has the values at start;
+/// Feature::settings gets each change.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Settings {
+    revision: u64,
+    values: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Settings {
+    /// The values of a JSON object; other text gives no values.
+    pub fn from_json(revision: u64, json: &str) -> Settings {
+        let values = match serde_json::from_str(json) { Ok(serde_json::Value::Object(m)) => m, _ => Default::default() };
+        Settings { revision, values }
+    }
+    pub fn revision(&self) -> u64 { self.revision }
+    pub fn get(&self, id: &str) -> Option<&serde_json::Value> { self.values.get(id) }
+    /// A toggle.
+    pub fn bool(&self, id: &str) -> Option<bool> { self.get(id)?.as_bool() }
+    /// A range or a number.
+    pub fn f64(&self, id: &str) -> Option<f64> { self.get(id)?.as_f64() }
+    /// A select value, a text or a color ("#rrggbb").
+    pub fn str(&self, id: &str) -> Option<&str> { self.get(id)?.as_str() }
 }
 
 /// The feature's handle to its host.
@@ -628,6 +675,20 @@ impl Host {
         unsafe { abi::text(self.api.data_dir, self.api.data_dir_len) }.filter(|p| !p.is_empty()).map(PathBuf::from)
     }
 
+    /// The settings at this start (API 6). Later changes come to Feature::settings.
+    pub fn settings(&self) -> Settings {
+        Settings::from_json(self.api.settings_revision, unsafe { abi::text(self.api.settings, self.api.settings_len) }.unwrap_or("{}"))
+    }
+
+    /// Offers the values that an older version of the feature saved on its own (a JSON object
+    /// by setting id), so a member keeps them after the move to settings (API 6, capability
+    /// ui_app). The app takes a value only for a setting that the member never changed and that
+    /// no import filled, and only when it fits; a taken value comes back to Feature::settings.
+    /// It is safe to offer at each start: the app takes each id once.
+    pub fn settings_import<T: Serialize>(&self, values: &T) -> Result<(), HostError> {
+        self.ui(SETTINGS_IMPORT_TOPIC, values)
+    }
+
     /// When the game process started; None when the host does not know it.
     pub fn game_started(&self) -> Option<SystemTime> {
         (self.api.game_started_us > 0).then(|| UNIX_EPOCH + Duration::from_micros(self.api.game_started_us))
@@ -722,6 +783,9 @@ pub trait Feature: Sized + 'static {
     /// control id. A held button always gets its "up" (focus loss, device loss, app exit, and
     /// before stop).
     fn control(&mut self, _id: &str, _value: Control) {}
+    /// The member changed the settings (API 6): all values of this version, with the new
+    /// revision. Only the app sends it, after its check against the version's schema.
+    fn settings(&mut self, _settings: &Settings) {}
     fn stop(&mut self) {}
     /// Err: the reason, which goes to the hook log; Feature Machine goes on (a removal still
     /// removes). Keep it short: the helper ends a hook after 30 s.
@@ -780,6 +844,13 @@ pub mod glue {
         let Some(id) = abi::text(e.id, e.id_len) else { return abi::BAD_ARGS };
         let raw = if e.attrs.is_null() || e.attrs_len == 0 { &[][..] } else { std::slice::from_raw_parts(e.attrs, e.attrs_len) };
         let attrs: Vec<(&str, Var)> = raw.iter().filter_map(|a| Var::from_abi(a)).collect();
+        // Settings ride on the event call too (abi::SETTINGS_EVENT, API 6).
+        if id == abi::SETTINGS_EVENT {
+            let data = attrs.iter().find_map(|(n, v)| match v { Var::Text(t) if *n == abi::SETTINGS_DATA => Some(t.as_str()), _ => None }).unwrap_or("{}");
+            let revision = attrs.iter().find_map(|(n, v)| match v { Var::U64(r) if *n == abi::SETTINGS_REVISION => Some(*r), _ => None }).unwrap_or(0);
+            let s = Settings::from_json(revision, data);
+            return catch_unwind(AssertUnwindSafe(|| f.settings(&s))).map_or(abi::FAILED, |_| abi::OK);
+        }
         // Page messages ride on the event call (abi::PAGE_EVENT), so the table needs no new field.
         if let Some(topic) = id.strip_prefix(abi::PAGE_EVENT) {
             let data = attrs.iter().find_map(|(n, v)| match v { Var::Text(t) if *n == abi::PAGE_DATA => Some(t.as_str()), _ => None }).unwrap_or("null");

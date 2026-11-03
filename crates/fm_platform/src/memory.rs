@@ -173,8 +173,10 @@ mod win {
             }
             Ok(())
         }
-        /// The handler address comes from a type-checked vtable in the exact build. Windows x64
-        /// has one C calling convention, so `fn(object)` matches the game's own call.
+        /// The handler comes from the vtable slot of a class-checked object, in the executable
+        /// code of the main image; fm_memory refuses it when the slot changed since the record.
+        /// The exact function is not proven (heat-mirage learning 58). Windows x64 has one C
+        /// calling convention, so `fn(object)` matches the game's own call.
         fn call(&mut self, function: u64, object: u64) -> Result<(), Error> {
             if !self.can_write() { return Err(Error::Unavailable("not at the qualified execution point".into())); }
             if !self.inside(function, 1) || !self.inside(object, 8) { return Err(Error::Unavailable("handler or object outside main image".into())); }

@@ -106,6 +106,59 @@ pub fn parse_user_file(arg: &str) -> Result<crate::UserFile, String> {
     Ok(f)
 }
 
+/// The helper argument of a user folder that is not the default (a -homedir session record):
+/// "<game>:<path>" ("ats:D:\ATSData\American Truck Simulator"). The first ":" ends the game id.
+pub fn user_root_arg(game: &str, root: &str) -> String {
+    format!("{game}:{root}")
+}
+
+/// The game and folder of a --user-root argument (user_root_arg). The game must have a user
+/// folder; Roots::new checks the folder itself when the helper uses it.
+pub fn parse_user_root(arg: &str) -> Result<(String, std::path::PathBuf), String> {
+    match arg.split_once(':') {
+        Some((game, path)) if crate::files::has_user_folder(game) && !path.is_empty() => Ok((game.into(), path.into())),
+        _ => Err(format!("bad --user-root {arg:?} (\"<game>:<folder>\" for a game with a user folder)")),
+    }
+}
+
+/// The user folder and the data folder of one hook call. With a --user-root, every key of that
+/// game uses that folder (never the default as a second guess) and the data folder of that
+/// folder (files::data_dir_for), as in the game that ran. Else the default folder and the base
+/// data folder, as before -homedir support.
+#[cfg(feature = "host")]
+#[derive(Debug)]
+pub struct Roots {
+    pub data_dir: std::path::PathBuf,
+    user_root: Option<(String, std::path::PathBuf)>,
+}
+
+#[cfg(feature = "host")]
+impl Roots {
+    /// Err: the --user-root folder fails files::check_user_root (the hook must not run on it).
+    pub fn new(base: &Path, user_root: Option<(String, std::path::PathBuf)>) -> Result<Roots, String> {
+        // The record's text can name the folder in another form (case, separators): the files
+        // and the data folder use its canonical path, as the game did (review r1 B1).
+        let user_root = match user_root {
+            Some((game, root)) => {
+                crate::files::check_user_root(&root).map_err(|e| format!("--user-root {game}: {e}; the record is refused"))?;
+                let root = crate::files::canonical_root(&root).map_err(|e| format!("--user-root {game}: {}: {e}; the record is refused", root.display()))?;
+                Some((game, root))
+            }
+            None => None,
+        };
+        let data_dir = user_root.as_ref().map_or_else(|| base.to_path_buf(), |(game, root)| crate::files::data_dir_for(base, game, root));
+        Ok(Roots { data_dir, user_root })
+    }
+
+    /// The user folder of `game` for files::Service.
+    pub fn root(&self, game: &str) -> Result<std::path::PathBuf, String> {
+        match &self.user_root {
+            Some((g, root)) if g == game => Ok(root.clone()),
+            _ => crate::files::default_user_root(game).ok_or_else(|| format!("{game} has no user folder in Feature Machine")),
+        }
+    }
+}
+
 /// Loads `library` and runs its hook for `event`. Ok(code) is an EXIT_* code; Err is a load
 /// failure (EXIT_LOAD_FAILED). Helper process only (header). The library stays loaded until the
 /// process ends, as in host.rs (a Rust library can keep thread-local destructors).
@@ -297,6 +350,41 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("user file: \"ats:game.log.txt\" is not declared")), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("game running \"msfs2024\": no process list")));
         assert_eq!(std::fs::read_to_string(t.path().join("profiles/41/config.cfg")).unwrap(), "uset a \"0.3\"\n");
+    }
+
+    /// -homedir: a --user-root folder serves every key of its game, with its own data folder,
+    /// through the real hook call. A record folder that is relative, missing or has no profiles
+    /// is refused; with no --user-root the default folder and the base data folder stay.
+    #[test]
+    fn a_user_root_from_the_record_serves_its_game() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("ATSData").join("American Truck Simulator");
+        std::fs::create_dir_all(home.join("profiles/41")).unwrap();
+        std::fs::write(home.join("profiles/41/config.cfg"), "uset a \"1\"\n").unwrap();
+        let arg = user_root_arg("ats", home.to_str().unwrap());
+        assert_eq!(parse_user_root(&arg), Ok(("ats".to_string(), home.clone())));
+        for bad in ["ats:", ":D:/x", "msfs2024:D:/x", "D"] {
+            assert!(parse_user_root(bad).is_err(), "{bad:?}");
+        }
+        let base = t.path().join("data");
+        let roots = Roots::new(&base, Some(parse_user_root(&arg).unwrap())).unwrap();
+        assert_eq!(roots.data_dir, crate::files::data_dir_for(&base, "ats", &home));
+        assert_ne!(roots.data_dir, base, "its own data folder");
+        assert_eq!(roots.root("ats"), Ok(crate::files::canonical_root(&home).unwrap()), "the canonical folder");
+        let list = [parse_user_file("write:ats:profiles/*/config.cfg").unwrap()];
+        let root_of = |g: &str| roots.root(g);
+        let s = Services { user_files: &list, root: &root_of, game_running: &not_running };
+        let mut lines = vec![];
+        let code = call(fm_feature_lifecycle, &Event::GameExited { game: "files".into() }, &roots.data_dir, &s, &mut |l| lines.push(l.to_string())).unwrap();
+        assert_eq!(code, EXIT_DONE);
+        assert!(lines.contains(&r#"read: Ok("uset a \"1\"\n")"#.to_string()), "{lines:?}");
+        assert_eq!(std::fs::read_to_string(home.join("profiles/41/config.cfg")).unwrap(), "uset a \"0.3\"\n", "written in the record's folder");
+        let refused = |root: std::path::PathBuf| Roots::new(&base, Some(("ats".into(), root))).err().unwrap();
+        assert!(refused("relative/American Truck Simulator".into()).contains("not an absolute path"));
+        assert!(refused(t.path().join("gone")).contains("does not exist"));
+        assert!(refused(t.path().join("ATSData")).contains("no profiles"));
+        let default = Roots::new(&base, None).unwrap();
+        assert_eq!((default.data_dir.as_path(), default.root("ats").ok()), (base.as_path(), crate::files::default_user_root("ats")));
     }
 
     /// The app passes each declared file as one argument; the helper takes only valid entries.

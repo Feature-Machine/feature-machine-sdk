@@ -1,7 +1,7 @@
 # Feature Machine creator CI (plan docs/plans/2026-10-24-feature-publishing-pipeline.md, L4).
 # Feedback only: the Feature Machine pipeline builds again from the reviewed commit and never
 # uses this output. It runs fm_pack build of the pushed commit with the fm_pack of the SDK commit
-# in the creator's Cargo.lock (the build that we do), then cargo test and cargo clippy.
+# in the creator's Cargo.lock (the build that we do), fm_pack deps, then cargo test and clippy.
 # It goes to the public SDK repository as .github/workflows/feature-machine.yml; creators call it.
 name: Feature Machine
 
@@ -17,8 +17,8 @@ permissions:
   contents: read
 
 env:
-  # The public SDK repository. Placeholder: the repository does not exist yet (plan L4).
-  FM_SDK_REPOSITORY: parallel42/feature-machine-sdk
+  # The SDK repository, in the Feature-Machine organization (move plan D9).
+  FM_SDK_REPOSITORY: Feature-Machine/feature-machine-sdk
 
 jobs:
   feature:
@@ -42,9 +42,10 @@ jobs:
           FEATURE_DIR: ${{ inputs.feature-dir }}
         run: |
           $manifest = (Resolve-Path "creator/$env:FEATURE_DIR/Cargo.toml").Path
-          $tree = cargo tree --locked -e normal --target x86_64-pc-windows-msvc --prefix depth -f '{p}' --manifest-path $manifest | Out-String
+          # "|" ends the depth: a package name can start with digits (review r6), never hold "|".
+          $tree = cargo tree --locked -e normal --target x86_64-pc-windows-msvc --prefix depth -f '|{p}' --manifest-path $manifest | Out-String
           if ($LASTEXITCODE -ne 0) { "::error::cargo tree --locked failed: commit an up-to-date Cargo.lock."; exit 1 }
-          $sdks = @($tree -split "`r?`n" | Where-Object { $_ -match '^[1-9][0-9]*fm_feature_sdk v' } | ForEach-Object { ($_ -replace '^[0-9]+', '') -replace ' \(\*\)$', '' } | Sort-Object -Unique)
+          $sdks = @($tree -split "`r?`n" | Where-Object { $_ -match '^[1-9][0-9]*\|fm_feature_sdk v' } | ForEach-Object { ($_ -replace '^[0-9]+\|', '') -replace ' \(\*\)$', '' } | Sort-Object -Unique)
           if ($sdks.Count -ne 1) { "::error::The feature must link one fm_feature_sdk (found $($sdks.Count))."; exit 1 }
           $source = $sdks[0]
           $shown = [regex]::Match($source, '^fm_feature_sdk v\S+ \((.+://.+)#([0-9a-f]+)\)$')
@@ -99,6 +100,15 @@ jobs:
 
       # After a successful build, the tests, the lint and the upload run even when one of them
       # fails, so the creator gets every result and the package in one run.
+      # The dependency gate of the submission review: which crates the review reads and which
+      # crates.io reputation accepts; a refused crate fails the run (dependencies.json says why).
+      - name: fm_pack deps (the dependency gate)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          & fm-sdk/target/release/fm_pack.exe deps (Join-Path $env:RUNNER_TEMP fm-out)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: cargo test
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: creator/${{ inputs.feature-dir }}

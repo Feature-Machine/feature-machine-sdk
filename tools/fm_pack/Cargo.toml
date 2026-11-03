@@ -19,7 +19,25 @@ serde = { workspace = true }
 schemars = { workspace = true }
 # The repo's cargo config in a build: the SDK source check refuses keys that swap a dependency (build.rs).
 toml = "1"
+# repack: copies the package entries raw (repack.rs); the version of fm_install.
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
+# deps: the dependency gate asks crates.io and OSV (deps.rs) and fetches approved binaries
+# (build.rs); dates of crates.io are RFC 3339.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+time = { version = "0.3", features = ["parsing", "formatting"] }
+# deps: machine code in a commit (COFF objects, archives, PE, ELF, Mach-O), by the object reader
+# of the Rust tools, not only by our own list of magic numbers.
+object = { version = "0.40.0", default-features = false, features = ["read", "std"] }
+# The diff read of a new dependency version (S2 step 6): the reviewed older `.crate` (a gzip tar)
+# is unpacked in memory, and the nearest older version is a semver order.
+flate2 = "1"
+tar = "0.4"
+semver = "1"
+# review-run: the raster art of a submission goes to the model as base64 data URLs.
+base64 = "0.22"
 
 [dev-dependencies]
 fm_install = { workspace = true, features = ["testing"] }
 tempfile = "3"
+# The v2 feed tests resolve entry URLs as the app does (Url::join).
+url = "2"

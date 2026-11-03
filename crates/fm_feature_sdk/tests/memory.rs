@@ -71,7 +71,7 @@ impl Feature for Writer {
 }
 
 fn meta(id: &str, caps: Vec<Capability>) -> ActiveFeature {
-    ActiveFeature { id: id.into(), version: "1.0.0".into(), library: "not-loaded".into(), games: vec!["msfs2024".into()], capabilities: caps, multiplayer: Multiplayer::Allowed, game_commands: vec![], network_hosts: vec![], memory_maps: vec![fm_feature_sdk::active::MapDependency { id: "test-map".into(), version: "1.0.0".into(), sha256: "a".repeat(64) }], data_dir: None, user_files: vec![] }
+    ActiveFeature { id: id.into(), version: "1.0.0".into(), library: "not-loaded".into(), games: vec!["msfs2024".into()], capabilities: caps, multiplayer: Multiplayer::Allowed, game_commands: vec![], network_hosts: vec![], memory_maps: vec![fm_feature_sdk::active::MapDependency { id: "test-map".into(), version: "1.0.0".into(), sha256: "a".repeat(64) }], data_dir: None, user_files: vec![], requires: vec![], settings: None }
 }
 unsafe extern "C" fn start(host: *const abi::HostApi, out: *mut abi::FeatureApi) -> i32 { fm_feature_sdk::glue::start::<Writer>(host, out) }
 fn entry() -> Entry { Entry { api: abi::API_VERSION, start } }
@@ -103,6 +103,21 @@ fn mapped_values_keep_their_key_and_require_memory_consent() {
     assert!(backend.logged("subscribe Err(Refused)"));
     assert!(backend.logged("acquire Err(Refused)"));
     assert!(!backend.logged("watch"));
+}
+
+// Ground wetness plan: a writer with no own pins uses the map that it requires from a module.
+#[test]
+fn a_map_required_from_a_module_is_declared() {
+    let backend = Arc::new(Mapped::new());
+    let mut set = FeatureSet::new("msfs2024", backend.clone(), false);
+    let mut writer = meta("writer", caps());
+    writer.memory_maps.clear();
+    writer.requires = vec![fm_feature_sdk::active::Requirement { interface: "mirrored-setter-v2".into(), versions: "^1.0".into(), map: "test-map".into() }];
+    set.add(writer, Ok(entry()));
+    set.event("read");
+    set.event("write");
+    assert!(backend.logged("watch mem:test-map/value true"));
+    assert!(!backend.logged("Err(Refused)"), "the required map is the feature's own");
 }
 
 #[test]

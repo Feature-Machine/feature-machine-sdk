@@ -21,8 +21,9 @@ pub fn install_root() -> Option<PathBuf> {
 }
 
 fn dirs_local() -> Option<PathBuf> {
-    // fm_paths uses the dirs crate for the same folder (LOCALAPPDATA, XDG_DATA_HOME).
-    fm_paths::data_dir().and_then(|d| d.parent().map(Path::to_path_buf))
+    // The per-user known folder itself (LOCALAPPDATA, XDG_DATA_HOME), never the parent of
+    // fm_paths::data_dir: a debug run with FM_DATA_DIR moves only the data, not the install.
+    dirs::data_local_dir()
 }
 
 /// The launcher in the install root (shortcuts and the link point to it, never to a version).

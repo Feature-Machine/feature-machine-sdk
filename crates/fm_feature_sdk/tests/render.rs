@@ -80,7 +80,7 @@ impl Feature for Painter {
 }
 
 fn meta(id: &str, caps: Vec<Capability>) -> ActiveFeature {
-    ActiveFeature { id: id.into(), version: "1.0.0".into(), library: "not-loaded".into(), games: vec!["msfs2024".into()], capabilities: caps, multiplayer: Multiplayer::Allowed, game_commands: vec![], network_hosts: vec![], memory_maps: vec![], data_dir: None, user_files: vec![] }
+    ActiveFeature { id: id.into(), version: "1.0.0".into(), library: "not-loaded".into(), games: vec!["msfs2024".into()], capabilities: caps, multiplayer: Multiplayer::Allowed, game_commands: vec![], network_hosts: vec![], memory_maps: vec![], data_dir: None, user_files: vec![], requires: vec![], settings: None }
 }
 unsafe extern "C" fn start(host: *const abi::HostApi, out: *mut abi::FeatureApi) -> i32 { fm_feature_sdk::glue::start::<Painter>(host, out) }
 fn entry() -> Entry { Entry { api: abi::API_VERSION, start } }

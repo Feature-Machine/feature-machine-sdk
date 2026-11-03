@@ -109,6 +109,19 @@ pub fn check_list(list: &[UserFile], games: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The real path of an existing user folder (std::fs::canonicalize) with no Windows "\\?\"
+/// prefix, so it stays a normal path in the report, sessions.json and the helper arguments.
+/// The plugin, the app record and the helper use it; Err: the folder does not exist.
+pub fn canonical_root(root: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let p = std::fs::canonicalize(root)?;
+    let plain = match p.to_str() {
+        Some(t) if t.starts_with(r"\\?\UNC\") => format!(r"\\{}", &t[8..]).into(),
+        Some(t) if t.starts_with(r"\\?\") => t[4..].into(),
+        _ => p,
+    };
+    Ok(plain)
+}
+
 #[cfg(feature = "host")]
 pub use io::*;
 
@@ -121,13 +134,92 @@ mod io {
     use std::time::UNIX_EPOCH;
 
     /// The default user folder of a game: ATS keeps its profiles and game.log.txt in
-    /// Documents\American Truck Simulator (Linux: the data folder). A "-homedir" start is not
-    /// followed here; the in-game host refuses such a game (Backend::user_root).
+    /// Documents\American Truck Simulator (Linux: the data folder). A "-homedir" start uses
+    /// another folder: the ATS plugin finds it (Backend::user_root) and reports it, and the app
+    /// gives it to the exit hook (fm_feature_hook --user-root).
     pub fn default_user_root(game: &str) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(docs) = TEST_DOCUMENTS.with(|d| d.borrow().clone()) {
+            return (game == "ats").then(|| docs.join("American Truck Simulator"));
+        }
         match game {
             "ats" => if cfg!(windows) { dirs::document_dir() } else { dirs::data_dir() }.map(|d| d.join("American Truck Simulator")),
             _ => None,
         }
+    }
+
+    // Unit tests only: a Documents folder for this thread. The real default folder can be missing
+    // on a test computer and tests must not write in Documents, so a test that needs an existing
+    // default folder (a junction to it, review r2) sets a temp folder here. One thread only, so
+    // tests that run at the same time keep the real default.
+    #[cfg(test)]
+    thread_local!(pub(crate) static TEST_DOCUMENTS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) });
+
+    /// The folder under a feature's data folder that holds one data folder per other user folder.
+    pub const USER_FOLDERS: &str = ".user-folders";
+
+    /// The data folder of a feature with user files when the game uses `root`: the base folder
+    /// for the default user folder, else base/.user-folders/<id of game and root>. So state about
+    /// one user folder's files (a journal of profile values) never meets another folder's files:
+    /// a hook with the default folder cannot repair a -homedir profile. The in-game host and the
+    /// hook helper both use this, so each gets the same folder for the same root.
+    pub fn data_dir_for(base: &Path, game: &str, root: &Path) -> PathBuf {
+        if default_user_root(game).is_some_and(|d| same_user_root(&d, root)) {
+            return base.to_path_buf();
+        }
+        base.join(USER_FOLDERS).join(root_id(game, root))
+    }
+
+    /// A stable id of a game and a user folder: FNV-1a 64 of "<game>\n<identity>", 16 hex
+    /// digits. Fixed math (not std's hasher, which can change), so the id stays over updates.
+    pub fn root_id(game: &str, root: &Path) -> String {
+        format!("{:016x}", fnv1a(&format!("{game}\n{}", identity(root))))
+    }
+
+    /// The one text of a folder for compare and hash (review r1 B1): its canonical path, which
+    /// has the names as stored on disk ("." and "..", junctions, subst resolved). No case fold
+    /// (review r2): Windows keeps "K" and the Kelvin sign apart, so must we. Windows: "\"
+    /// separators, no end separator, an upper case drive letter. A folder that is gone keeps its
+    /// text in that form (no I/O goes there: check_user_root).
+    pub(crate) fn identity(root: &Path) -> String {
+        let p = super::canonical_root(root).unwrap_or_else(|_| root.to_path_buf());
+        let text = p.to_string_lossy();
+        if !cfg!(windows) {
+            return text.trim_end_matches('/').to_string();
+        }
+        let mut t = text.replace('/', "\\").trim_end_matches('\\').to_string();
+        if t.as_bytes().get(1) == Some(&b':') {
+            if let Some(drive) = t.get_mut(0..1) {
+                drive.make_ascii_uppercase();
+            }
+        }
+        t
+    }
+
+    /// True when two paths name one user folder (identity): the host's default folder check and
+    /// data_dir_for use it, so an alias of the default folder is the default folder.
+    pub fn same_user_root(a: &Path, b: &Path) -> bool {
+        identity(a) == identity(b)
+    }
+
+    pub(crate) fn fnv1a(text: &str) -> u64 {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// The check of a user folder that is not the default (a -homedir folder from a session
+    /// record): an absolute path to a folder that has "profiles" or "steam_profiles" in it. The
+    /// helper refuses another one with this reason, never a guess (plan, -homedir section).
+    pub fn check_user_root(root: &Path) -> Result<(), String> {
+        if !root.is_absolute() {
+            return Err(format!("the user folder {} is not an absolute path", root.display()));
+        }
+        if !root.is_dir() {
+            return Err(format!("the user folder {} does not exist", root.display()));
+        }
+        if !["profiles", "steam_profiles"].iter().any(|p| root.join(p).is_dir()) {
+            return Err(format!("the user folder {} has no profiles or steam_profiles folder", root.display()));
+        }
+        Ok(())
     }
 
     /// The checked list, the scope and the user folder of one feature: what host.rs and hook.rs
@@ -288,6 +380,97 @@ mod tests {
         let json = serde_json::to_string(&list()[1]).unwrap();
         assert_eq!(json, r#"{"game":"ats","path":"profiles/*/config.cfg","access":"write"}"#);
         assert!(serde_json::from_str::<UserFile>(r#"{"game":"ats","path":"x","access":"read","extra":1}"#).is_err());
+    }
+
+    /// -homedir: the default folder keeps the base data folder (no change for a default game);
+    /// another folder gets its own data folder with a stable id. A record's folder must be
+    /// absolute, exist and have profiles or steam_profiles.
+    #[cfg(feature = "host")]
+    #[test]
+    fn another_user_folder_gets_its_own_data_folder() {
+        let base = std::path::Path::new("/fm/features/weather/data");
+        let default = default_user_root("ats").expect("a default ATS folder on this computer");
+        assert_eq!(data_dir_for(base, "ats", &default), base, "the default folder: the base data folder");
+        let home = std::path::Path::new("D:/ATSData/American Truck Simulator");
+        let split = data_dir_for(base, "ats", home);
+        assert_eq!(split, base.join(USER_FOLDERS).join(root_id("ats", home)));
+        assert_eq!(root_id("ats", home), root_id("ats", home), "stable");
+        assert_ne!(root_id("ats", home), root_id("ats", std::path::Path::new("D:/Other/American Truck Simulator")));
+        assert_ne!(root_id("ats", home), root_id("ets2", home));
+        assert_eq!(root_id("ats", std::path::Path::new("")).len(), 16);
+        // FNV-1a 64 of "a": the published test vector, so the math is the fixed one.
+        assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
+        let t = tempfile::tempdir().unwrap();
+        assert!(check_user_root(std::path::Path::new("relative/ATS")).unwrap_err().contains("not an absolute path"));
+        assert!(check_user_root(&t.path().join("gone")).unwrap_err().contains("does not exist"));
+        assert!(check_user_root(t.path()).unwrap_err().contains("no profiles"));
+        std::fs::create_dir(t.path().join("steam_profiles")).unwrap();
+        assert_eq!(check_user_root(t.path()), Ok(()));
+    }
+
+    /// Review r1 B1: one Windows folder in another form (case, "/" separators, an end separator,
+    /// "." and "..") is one identity, so one data folder; canonical_root gives a normal path (no
+    /// "\\?\" prefix). The default folder in another case is still the default.
+    #[cfg(feature = "host")]
+    #[test]
+    fn one_folder_in_other_forms_is_one_data_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("ATS Data").join("American Truck Simulator");
+        std::fs::create_dir_all(home.join("profiles")).unwrap();
+        let canon = canonical_root(&home).unwrap();
+        assert!(!canon.to_string_lossy().starts_with(r"\\?\") && canon.is_absolute(), "{canon:?}");
+        let base = std::path::Path::new("/fm/data");
+        let want = data_dir_for(base, "ats", &home);
+        let text = home.to_string_lossy().into_owned();
+        let mut forms = vec![home.join("profiles").join(".."), home.join(".").join("profiles").join("..")];
+        if cfg!(windows) {
+            forms.extend([text.to_uppercase(), text.to_lowercase().replace('\\', "/") + "/", text.clone() + "\\"].map(std::path::PathBuf::from));
+        }
+        for f in &forms {
+            assert_eq!(data_dir_for(base, "ats", f), want, "{f:?}");
+        }
+        assert_eq!(canonical_root(&forms[0]).unwrap(), canon);
+        // The default folder can be missing on a test computer: separators, an end separator and
+        // a lower case drive letter are the forms that need no disk (review r2).
+        let default = default_user_root("ats").unwrap();
+        let mut other = default.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            other = other.replace('\\', "/") + "/";
+            other.get_mut(0..1).unwrap().make_ascii_lowercase();
+        } else {
+            other += "/";
+        }
+        assert_eq!(data_dir_for(base, "ats", std::path::Path::new(&other)), base, "the default folder in another form: {other}");
+    }
+
+    /// Review r2: two real folders whose names only a case fold makes equal ("K" and the
+    /// Kelvin sign U+212A; Windows keeps them apart) are two data folders, never one journal.
+    #[cfg(all(feature = "host", windows))]
+    #[test]
+    fn folders_that_windows_keeps_apart_are_two_data_folders() {
+        let t = tempfile::tempdir().unwrap();
+        let (k, kelvin) = (t.path().join("K"), t.path().join("\u{212A}"));
+        std::fs::create_dir(&k).unwrap();
+        std::fs::create_dir(&kelvin).expect("NTFS keeps K and the Kelvin sign apart");
+        assert_ne!(canonical_root(&k).unwrap(), canonical_root(&kelvin).unwrap());
+        let base = std::path::Path::new("/fm/data");
+        assert_ne!(data_dir_for(base, "ats", &k), data_dir_for(base, "ats", &kelvin));
+        assert!(!same_user_root(&k, &kelvin));
+    }
+
+    /// Review r2: a junction to a folder is that folder (same_user_root, the host's default
+    /// check), and so is one data folder.
+    #[cfg(all(feature = "host", windows))]
+    #[test]
+    fn a_junction_is_the_folder_that_it_names() {
+        let t = tempfile::tempdir().unwrap();
+        let (real, link) = (t.path().join("real"), t.path().join("link"));
+        std::fs::create_dir(&real).unwrap();
+        let made = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"]).arg(&link).arg(&real).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        assert!(same_user_root(&real, &link));
+        let base = std::path::Path::new("/fm/data");
+        assert_eq!(data_dir_for(base, "ats", &link), data_dir_for(base, "ats", &real));
     }
 
     /// The I/O of the service: info of a missing file, a read in parts, an atomic write that

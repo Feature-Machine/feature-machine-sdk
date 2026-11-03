@@ -11,13 +11,20 @@ const VTABLE: usize = 0x2000;
 /// A second tweak class in .rdata, for the shared-class rule.
 const VTABLE2: usize = 0x2100;
 const HANDLER: u64 = BASE + 0x1100;
+/// The handler RVA that a saved result holds for the wet-speed setter.
+const RVA: Option<u64> = Some(HANDLER - BASE);
+/// Two other real functions in .text: WRONG clears the value, DTOR is slot 0 of the tweak
+/// vtable. A slot that holds one of them is a wrong handler that is still in read-only code.
+const WRONG: u64 = BASE + 0x1200;
+const DTOR: u64 = BASE + 0x1300;
 const OBJECTS: usize = 0x3000;
 /// Pattern start inside an object; value, mirror and clamps are relative to it.
 const P: usize = 8;
 const VALUE: usize = 0x44;
 
 /// `exe`: the exe digest that the reader gives ("" for a Store build that it cannot hash).
-struct Game { bytes: Vec<u8>, calls: Vec<(u64, u64)>, exe: String }
+/// `writes`: the count of writes; `refuse_calls`: each handler call fails (and is not recorded).
+struct Game { bytes: Vec<u8>, calls: Vec<(u64, u64)>, exe: String, writes: u32, refuse_calls: bool }
 
 impl Game {
     /// `names[k]` is the inline name of object k (objects of 0x80 bytes in .data).
@@ -36,7 +43,16 @@ impl Game {
         }
         b[VTABLE + 16..VTABLE + 24].copy_from_slice(&HANDLER.to_le_bytes());
         b[VTABLE2 + 16..VTABLE2 + 24].copy_from_slice(&HANDLER.to_le_bytes());
-        let mut g = Self { bytes: b, calls: vec![], exe: "c".repeat(64) };
+        // x64 bodies (rcx = object): HANDLER copies the value (+0x4C) to the mirror (+0x48) like
+        // slot 2 on 1.9.20.0; WRONG stores 0 in the value; DTOR loads the vtable pointer.
+        let code: [(u64, &[u8]); 3] = [
+            (HANDLER, &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xF3, 0x0F, 0x10, 0x41, 0x4C, 0xF3, 0x0F, 0x11, 0x41, 0x48, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3]),
+            (WRONG, &[0xC7, 0x41, 0x4C, 0x00, 0x00, 0x00, 0x00, 0xC3]),
+            (DTOR, &[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x01, 0x48, 0x83, 0xC4, 0x28, 0xC3]),
+        ];
+        for (f, body) in code { let at = (f - BASE) as usize; b[at..at + body.len()].copy_from_slice(body); }
+        b[VTABLE..VTABLE + 8].copy_from_slice(&DTOR.to_le_bytes());
+        let mut g = Self { bytes: b, calls: vec![], exe: "c".repeat(64), writes: 0, refuse_calls: false };
         for (k, name) in names.iter().enumerate() { g.object(k, name, (BASE + VTABLE as u64).to_le_bytes(), 0.001); }
         g
     }
@@ -51,6 +67,8 @@ impl Game {
         self.f32(o + P + VALUE + 12, 1.0);
     }
     fn f32(&mut self, at: usize, v: f32) { self.bytes[at..at + 4].copy_from_slice(&v.to_le_bytes()); }
+    /// Puts `function` in slot `n` of the tweak vtable (as an update or a hook could).
+    fn slot(&mut self, n: usize, function: u64) { self.bytes[VTABLE + n * 8..VTABLE + n * 8 + 8].copy_from_slice(&function.to_le_bytes()); }
     fn value(&self, k: usize) -> (f32, f32) {
         let at = OBJECTS + k * 0x80 + P + VALUE;
         let f = |a: usize| f32::from_le_bytes(self.bytes[a..a + 4].try_into().unwrap());
@@ -71,9 +89,14 @@ impl Memory for Game {
     fn write(&mut self, address: u64, data: &[u8]) -> Result<(), Error> {
         let at = (address - BASE) as usize;
         self.bytes[at..at + data.len()].copy_from_slice(data);
+        self.writes += 1;
         Ok(())
     }
-    fn call(&mut self, function: u64, object: u64) -> Result<(), Error> { self.calls.push((function, object)); Ok(()) }
+    fn call(&mut self, function: u64, object: u64) -> Result<(), Error> {
+        if self.refuse_calls { return Err(Error::Unavailable("call refused".into())); }
+        self.calls.push((function, object));
+        Ok(())
+    }
 }
 
 fn hex(s: &str) -> String { s.bytes().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ") }
@@ -254,7 +277,7 @@ fn symbols_of_one_class_must_share_its_vtable() {
 /// The saved result of the proved one-symbol map on exe "c..c" with an all-zero file digest.
 fn saved() -> Proof {
     Proof { exe: "c".repeat(64), map: "weather".into(), version: "1.1.0".into(), file: "0".repeat(64),
-        symbols: [("wet-speed".to_string(), Found { pattern: (OBJECTS + P) as u64, vtable: VTABLE as u64 })].into() }
+        symbols: [("wet-speed".to_string(), Found { pattern: (OBJECTS + P) as u64, vtable: VTABLE as u64, handler: RVA })].into() }
 }
 
 #[test]
@@ -304,7 +327,7 @@ fn an_exe_with_no_digest_never_saves_or_uses_a_result() {
 fn each_saved_vtable_of_a_shared_class_is_compared() {
     let names = ["GAME/Weather/WetSpeed", "GAME/Weather/DrySpeed", "GAME/A", "GAME/B", "GAME/C", "GAME/D"];
     let g = Game::new(&names);
-    let found = |k: usize, vtable: usize| Found { pattern: (OBJECTS + k * 0x80 + P) as u64, vtable: vtable as u64 };
+    let found = |k: usize, vtable: usize| Found { pattern: (OBJECTS + k * 0x80 + P) as u64, vtable: vtable as u64, handler: RVA };
     let proof = |dry: usize| Proof { exe: "c".repeat(64), map: "weather".into(), version: "1.1.0".into(), file: "0".repeat(64),
         symbols: [("wet-speed".to_string(), found(0, VTABLE)), ("dry-speed".to_string(), found(1, dry))].into() };
     let image = g.image(&"c".repeat(64));
@@ -337,9 +360,12 @@ fn a_saved_result_that_differs_is_refused() {
     assert!(refused(&Proof { version: "1.0.0".into(), ..saved() }, &image, [0; 32]), "another map version");
     assert!(refused(&Proof { symbols: Default::default(), ..saved() }, &image, [0; 32]), "other symbols");
     let moved = |f: Found| Proof { symbols: [("wet-speed".to_string(), f)].into(), ..saved() };
-    assert!(refused(&moved(Found { pattern: (OBJECTS + 0x80 + P) as u64, vtable: VTABLE as u64 }), &image, [0; 32]), "the pattern is not at the saved place");
-    assert!(refused(&moved(Found { pattern: u64::MAX, vtable: VTABLE as u64 }), &image, [0; 32]), "a saved place outside the image");
-    assert!(refused(&moved(Found { pattern: (OBJECTS + P) as u64, vtable: VTABLE2 as u64 }), &image, [0; 32]), "another vtable");
+    assert!(refused(&moved(Found { pattern: (OBJECTS + 0x80 + P) as u64, vtable: VTABLE as u64, handler: RVA }), &image, [0; 32]), "the pattern is not at the saved place");
+    assert!(refused(&moved(Found { pattern: u64::MAX, vtable: VTABLE as u64, handler: RVA }), &image, [0; 32]), "a saved place outside the image");
+    assert!(refused(&moved(Found { pattern: (OBJECTS + P) as u64, vtable: VTABLE2 as u64, handler: RVA }), &image, [0; 32]), "another vtable");
+    let handler = |handler: Option<u64>| moved(Found { pattern: (OBJECTS + P) as u64, vtable: VTABLE as u64, handler });
+    assert!(refused(&handler(Some(WRONG - BASE)), &image, [0; 32]), "another handler RVA");
+    assert!(refused(&handler(None), &image, [0; 32]), "a record with no handler (older format)");
     // The checks of a full resolve still run: a mirror against the contract.
     let mut bad = Game::new(&NAMES);
     bad.f32(OBJECTS + P + VALUE - 4, 0.5);
@@ -347,4 +373,170 @@ fn a_saved_result_that_differs_is_refused() {
     let mut exact = m.clone();
     exact.sha256 = Some("c".repeat(64));
     assert!(matches!(exact.resolve_proved(&image, [0; 32], &saved()), Err(Error::Unavailable(_))), "an exact map takes no saved result");
+}
+
+// Wrong executable handler (GPT-6-Astra review, overnight 2026-10-26): slot 2 holds ANOTHER
+// function in read-only code. Handler slot stability (option 2): the record saves the handler
+// RVA and the runtime reads the slot again before each use, so a CHANGE is refused. `limit_`
+// tests lock what stays: a first resolution takes a stable wrong function. The fake game only
+// records calls, never runs native code. Identity check: the owner decides. Never test in the game.
+
+/// The tweak object: the `object` argument of each handler call.
+const OBJECT: u64 = BASE + OBJECTS as u64;
+
+/// Acquire, write 0.5 and release; gives the handler calls (function, object).
+fn write_once(r: &mut Runtime<Game>) -> Vec<(u64, u64)> {
+    let h = r.acquire("f", KEY).unwrap();
+    r.set("f", h, Scalar::F32(0.5)).unwrap();
+    r.release("f", h).unwrap();
+    std::mem::take(&mut r.memory_mut().calls)
+}
+
+#[test]
+fn limit_a_wrong_function_in_code_passes_the_initial_resolution_and_the_watch() {
+    let m = map("GAME/Weather/WetSpeed", 4, None);
+    // HANDLER + 6 skips the prologue: never safe to run; safe here only because calls are recorded.
+    for (why, wrong) in [("another function", WRONG), ("the slot 0 function", DTOR), ("the middle of the right function", HANDLER + 6)] {
+        let mut g = Game::new(&NAMES);
+        g.slot(2, wrong);
+        let mut r = runtime(g, &m);
+        assert_eq!(watch_full(&mut r), vec![KEY.to_string()], "{why}: the watch does not read the handler");
+        assert_eq!(write_once(&mut r), vec![(wrong, OBJECT), (wrong, OBJECT)], "{why}: LIMIT, the write and the restore call it");
+    }
+}
+
+#[test]
+fn limit_an_exact_map_also_takes_a_wrong_function_in_code() {
+    let mut g = Game::new(&NAMES);
+    g.slot(2, WRONG);
+    let mut m = serde_json::to_value(map("GAME/Weather/WetSpeed", 4, Some(&"c".repeat(64)))).unwrap();
+    m["symbols"][0].as_object_mut().unwrap().remove("class_guard");
+    m["symbols"][0]["type_guard"] = serde_json::json!({ "offset": -8, "rva": VTABLE });
+    let mut r = runtime(g, &serde_json::from_value(m).unwrap());
+    // v1 pins the exe digest: if the approved slot was right for that exe, only a live patch before
+    // the snapshot gets here. The digest proves the file, not what the handler does.
+    assert_eq!(write_once(&mut r), vec![(WRONG, OBJECT), (WRONG, OBJECT)], "LIMIT: no watch, the wrong function is called");
+}
+
+#[test]
+fn refused_a_handler_in_writable_code_or_in_data() {
+    let m = map("GAME/Weather/WetSpeed", 4, None);
+    let mut g = Game::new(&NAMES);
+    g.bytes[0x148 + 36..0x148 + 40].copy_from_slice(&0xE000_0020u32.to_le_bytes()); // .text gets write
+    assert_eq!(m.resolve(&g.image("x")).err(), Some(Error::Unavailable("change handler outside module code".into())));
+    // The saved path checks the handler again (plan slice 3: "the handler in code").
+    let mut g = Game::new(&NAMES);
+    g.slot(2, BASE + VTABLE2 as u64);
+    let e = m.resolve_proved(&g.image(&"c".repeat(64)), [0; 32], &saved()).err();
+    assert_eq!(e, Some(Error::Unavailable("change handler outside module code".into())));
+}
+
+#[test]
+fn refused_a_saved_result_whose_handler_changed_on_its_exe() {
+    let m = map("GAME/Weather/WetSpeed", 4, None);
+    let mut r = runtime(Game::new(&NAMES), &m);
+    watch_full(&mut r);
+    assert_eq!(write_once(&mut r), vec![(HANDLER, OBJECT), (HANDLER, OBJECT)], "proved with the right handler");
+    let proof = r.proof("weather").unwrap();
+    assert_eq!(proof, saved(), "the record holds the pattern, vtable and handler RVAs");
+    // The next start on the same exe digest: slot 2 now holds another function (a hook).
+    let mut g = Game::new(&NAMES);
+    g.slot(2, WRONG);
+    let e = m.resolve_proved(&g.image(&"c".repeat(64)), [0; 32], &proof).err();
+    assert_eq!(e, Some(Error::Unavailable("wet-speed: saved result differs from the image: handler".into())));
+    // Residual: the host fallback is the full search, which takes a stable wrong function.
+    let mut r = runtime(g, &m);
+    assert_eq!(watch_full(&mut r), vec![KEY.to_string()], "LIMIT: the full search and the watch take it");
+}
+
+#[test]
+fn an_old_record_without_the_handler_reads_but_is_refused() {
+    let old = serde_json::json!({ "exe": "c".repeat(64), "map": "weather", "version": "1.1.0", "file": "0".repeat(64),
+        "symbols": { "wet-speed": { "pattern": OBJECTS + P, "vtable": VTABLE } } });
+    let old: Proof = serde_json::from_value(old).unwrap();
+    assert_eq!(old.symbols["wet-speed"].handler, None);
+    let e = map("GAME/Weather/WetSpeed", 4, None).resolve_proved(&Game::new(&NAMES).image(&"c".repeat(64)), [0; 32], &old).err();
+    assert_eq!(e, Some(Error::Unavailable("wet-speed: saved result differs from the image: handler".into())));
+    let new = serde_json::to_value(saved()).unwrap();
+    assert_eq!(new["symbols"]["wet-speed"]["handler"], serde_json::json!(HANDLER - BASE), "a new record writes the field");
+}
+
+#[test]
+fn refused_a_slot_change_during_the_watch() {
+    let mut r = runtime(Game::new(&NAMES), &map("GAME/Weather/WetSpeed", 4, None));
+    r.memory_mut().slot(2, WRONG); // live memory, after the image snapshot
+    assert!(watch_full(&mut r).is_empty() && !r.proved(KEY), "the watch reads the slot each time");
+    assert!(r.watch_error("weather").is_some_and(|e| e.contains("change handler slot differs")), "{:?}", r.watch_error("weather"));
+    assert!(matches!(r.acquire("f", KEY), Err(Error::Unavailable(_))), "no writer");
+    // The slot back to the resolved handler: a new full watch proves it. No call before that.
+    r.memory_mut().slot(2, HANDLER);
+    assert_eq!((0..5).flat_map(|i| r.watch(20_000 + i * WATCH_MS / 4)).collect::<Vec<_>>(), vec![KEY.to_string()]);
+    assert!(r.memory_mut().calls.is_empty());
+}
+
+#[test]
+fn refused_a_write_after_a_slot_change_between_acquire_and_set() {
+    let mut r = runtime(Game::new(&NAMES), &map("GAME/Weather/WetSpeed", 4, None));
+    watch_full(&mut r);
+    let h = r.acquire("f", KEY).unwrap();
+    r.memory_mut().slot(2, DTOR);
+    assert_eq!(r.set("f", h, Scalar::F32(0.5)), Err(Error::Unavailable("change handler slot differs from the resolved handler".into())));
+    assert_eq!((r.memory_mut().calls.len(), r.memory_mut().value(0)), (0, (0.001, 0.001)), "no write, no call");
+    // Nothing to restore: the lease ends with no write and no call, as its object guard holds.
+    assert_eq!(r.release("f", h), Ok(()));
+    assert!(!r.holds("f") && r.memory_mut().calls.is_empty());
+    assert!(matches!(r.acquire("f", KEY), Err(Error::Unavailable(_))), "a new writer is refused at acquire");
+}
+
+#[test]
+fn refused_a_pending_restore_call_after_a_slot_change_then_one_call_with_no_write() {
+    let mut r = runtime(Game::new(&NAMES), &map("GAME/Weather/WetSpeed", 4, None));
+    watch_full(&mut r);
+    let h = r.acquire("f", KEY).unwrap();
+    r.set("f", h, Scalar::F32(0.5)).unwrap();
+    // The restore writes the original, then its handler call fails: the call stays pending.
+    r.memory_mut().refuse_calls = true;
+    assert!(r.release("f", h).is_err() && r.holds("f"));
+    let writes = r.memory_mut().writes;
+    assert_eq!((r.memory_mut().value(0), r.memory_mut().calls.len()), ((0.001, 0.001), 1), "restored, only the set call");
+    // The slot changes while the call is pending: refused, no call, no write, the lease stays.
+    r.memory_mut().refuse_calls = false;
+    r.memory_mut().slot(2, WRONG);
+    assert!(matches!(r.release("f", h), Err(Error::Unavailable(t)) if t.contains("change handler slot differs")));
+    assert_eq!((r.holds("f"), r.memory_mut().calls.len(), r.memory_mut().writes), (true, 1, writes));
+    // The slot back: one call of the resolved handler, no other write, and the lease ends.
+    r.memory_mut().slot(2, HANDLER);
+    assert_eq!(r.release("f", h), Ok(()));
+    assert_eq!((r.holds("f"), r.memory_mut().calls.clone(), r.memory_mut().writes), (false, vec![(HANDLER, OBJECT); 2], writes));
+}
+
+#[test]
+fn refused_a_restore_after_a_slot_change_keeps_the_lease_and_the_written_value() {
+    let mut r = runtime(Game::new(&NAMES), &map("GAME/Weather/WetSpeed", 4, None));
+    watch_full(&mut r);
+    let h = r.acquire("f", KEY).unwrap();
+    r.set("f", h, Scalar::F32(0.5)).unwrap();
+    r.memory_mut().slot(2, WRONG);
+    assert!(matches!(r.release("f", h), Err(Error::Unavailable(t)) if t.contains("change handler slot differs")));
+    // As for a class change: no write, no call, the lease stays. The game keeps the value and
+    // mirror of its last handler call, a state that its own handler made.
+    assert!(r.holds("f"), "the lease stays for a later cleanup");
+    assert_eq!((r.memory_mut().value(0), r.memory_mut().calls.clone()), ((0.5, 0.5), vec![(HANDLER, OBJECT)]), "no write, no call");
+    assert_eq!((r.stop("f").len(), r.holds("f"), r.admit("f")), (1, true, Err(Error::Refused)), "stop reports it; the owner stays closed");
+    // The slot back (a hook removed): the later cleanup restores and calls the resolved handler.
+    r.memory_mut().slot(2, HANDLER);
+    assert_eq!(r.release("f", h), Ok(()));
+    assert_eq!((r.memory_mut().value(0), r.memory_mut().calls.clone()), ((0.001, 0.001), vec![(HANDLER, OBJECT); 2]));
+}
+
+#[test]
+fn refused_an_object_that_moves_to_a_class_with_another_handler_during_a_lease() {
+    let mut r = runtime(Game::new(&NAMES), &map("GAME/Weather/WetSpeed", 4, None));
+    watch_full(&mut r);
+    let h = r.acquire("f", KEY).unwrap();
+    r.memory_mut().bytes[VTABLE2 + 16..VTABLE2 + 24].copy_from_slice(&WRONG.to_le_bytes());
+    r.memory_mut().bytes[OBJECTS..OBJECTS + 8].copy_from_slice(&(BASE + VTABLE2 as u64).to_le_bytes());
+    assert!(matches!(r.set("f", h, Scalar::F32(0.5)), Err(Error::Unavailable(_))), "the object guard sees the vtable pointer");
+    assert!(matches!(r.release("f", h), Err(Error::Unavailable(_))) && r.holds("f"), "the lease stays for a later cleanup");
+    assert_eq!((r.memory_mut().calls.len(), r.memory_mut().value(0)), (0, (0.001, 0.001)), "no write, no call");
 }

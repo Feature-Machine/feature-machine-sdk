@@ -20,7 +20,7 @@ Feature Machine hosts load in the game.
    crate-type = ["cdylib", "rlib"]
 
    [dependencies]
-   fm_feature_sdk = { git = "https://github.com/parallel42/feature-machine-sdk", tag = "v0.1.0" }
+   fm_feature_sdk = { git = "https://github.com/Feature-Machine/feature-machine-sdk", tag = "v0.2.0" }
    ```
 
 2. Add `feature.json` next to `Cargo.toml`.
@@ -31,6 +31,9 @@ Feature Machine hosts load in the game.
    the commit that it reviews.
 
 The build accepts `fm_feature_sdk` only from this repository at a release tag.
+
+A page (your HTML in `ui/`) uses the page SDK: see `crates/fm_feature_sdk/page/README.md`.
+Widgets on the member's home grid come from a views file: see `crates/fm_install/VIEWS.md`.
 
 ## Build a package on your computer (Windows)
 

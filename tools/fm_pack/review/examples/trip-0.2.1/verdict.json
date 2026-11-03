@@ -23,5 +23,6 @@
   "cleared": [
     "The unsafe call at features/trip/src/lib.rs:197 is test code only.",
     "Frame work has no unbounded loop or growing collection; page updates are at 4 Hz."
-  ]
+  ],
+  "dependencies": []
 }

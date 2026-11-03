@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 
 pub mod feature;
 pub mod package;
+pub mod release;
 pub mod memory;
+pub mod module;
+pub mod surfaces;
+pub mod views;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_signing;
 
@@ -54,6 +58,8 @@ pub fn check_version(v: &str) -> io::Result<semver::Version> {
 pub enum Kind {
     App,
     Feature,
+    /// A module package (module layer plan 8.1): module.json and its maps/ folder only.
+    Module,
 }
 
 impl Kind {
@@ -61,6 +67,7 @@ impl Kind {
         match self {
             Kind::App => app_exe_name(),
             Kind::Feature => FEATURE_MANIFEST.to_string(),
+            Kind::Module => module::MANIFEST.to_string(),
         }
     }
 }
@@ -85,6 +92,10 @@ pub(crate) fn checked_entries<R: Read + Seek>(a: &mut zip::ZipArchive<R>, kind: 
             if kind == Kind::Feature && !(feature::parts::DIRS.contains(&top.as_str()) || file) {
                 return Err(bad(format!("not a feature package part: {name:?}")));
             }
+            let module_part = (top == module::MANIFEST && !is_dir && rel.components().count() == 1) || (top == "maps" && (is_dir || rel.components().count() > 1));
+            if kind == Kind::Module && !module_part {
+                return Err(bad(format!("not a module package part: {name:?}")));
+            }
             if !seen.insert(rel.to_string_lossy().to_lowercase()) {
                 return Err(bad(format!("the package has {name:?} twice")));
             }
@@ -108,10 +119,38 @@ impl Install {
         Self { root: root.into(), kind: Kind::Feature }
     }
 
-    /// The active complete version and its folder.
+    /// The store of one module: <data>/modules/store/<id>. It has no active version: each kept
+    /// lock names the versions that it needs (module::prune).
+    pub fn module(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into(), kind: Kind::Module }
+    }
+
+    /// The folders in versions/ that `keep` does not name (staging folders too): what a module
+    /// prune removes. Err: the folder or one entry does not read, so the prune removes nothing
+    /// (Sol r6 R6-1). A missing folder has none.
+    pub fn stale(&self, keep: &[String]) -> Result<Vec<PathBuf>, String> {
+        let dir = self.root.join(VERSIONS);
+        let list = entries(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        Ok(list.into_iter().filter(|p| !keep.iter().any(|k| p.file_name().is_some_and(|n| n == k.as_str()))).collect())
+    }
+
+    /// The active complete version and its folder. A read error reads as none: for views only.
+    /// The module lock uses active_checked (Sol r7 follow-up).
     pub fn active(&self) -> Option<(String, PathBuf)> {
-        let s = self.state().ok()??;
-        self.is_complete(&s.active).then(|| (s.active.clone(), self.version_dir(&s.active)))
+        self.active_checked().ok().flatten()
+    }
+
+    /// active() that keeps a read error. Ok(None): not installed, a damaged state.json (the
+    /// setup repairs it, and the hosts read it as none too) or an active version that is not
+    /// complete. Err: state.json or the version marker does not read.
+    pub fn active_checked(&self) -> io::Result<Option<(String, PathBuf)>> {
+        let s = match self.state() {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(self.complete(&s.active)?.then(|| (s.active.clone(), self.version_dir(&s.active))))
     }
 
     pub fn root(&self) -> &Path {
@@ -135,16 +174,33 @@ impl Install {
         self.root.join(VERSIONS).join(version)
     }
 
+    /// complete() with a stat error read as false: each caller then refuses (not installed).
+    /// One rule for both (Sol r8 R8-2).
     pub fn is_complete(&self, version: &str) -> bool {
-        check_version(version).is_ok() && self.version_dir(version).join(COMPLETE).is_file()
+        self.complete(version).unwrap_or(false)
+    }
+
+    /// Ok(true) when `version` is a complete version folder: its marker is a file (a folder of
+    /// that name is not one, Sol r8 R8-2). A missing marker is incomplete. Err: the marker does
+    /// not stat; the error names it (R8-3).
+    pub fn complete(&self, version: &str) -> io::Result<bool> {
+        if check_version(version).is_err() { return Ok(false); }
+        let marker = self.version_dir(version).join(COMPLETE);
+        match std::fs::metadata(&marker) {
+            Ok(m) => Ok(m.is_file()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io::Error::new(e.kind(), format!("{}: {e}", marker.display()))),
+        }
     }
 
     /// None before the first install. A damaged file is an error: the setup repairs it.
     pub fn state(&self) -> io::Result<Option<State>> {
-        match std::fs::read(self.root.join(STATE)) {
-            Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        let path = self.root.join(STATE);
+        match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+            // The path in the error: the card shows it (Sol r8 R8-3).
+            Err(e) => Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
         }
     }
 
@@ -168,11 +224,14 @@ impl Install {
         }
         let versions = self.root.join(VERSIONS);
         std::fs::create_dir_all(&versions)?;
-        let staging = versions.join(format!("{STAGING}{version}"));
-        remove_dir(&staging)?;
+        // A staging folder of its own (process and counter): two unpacks of one version never
+        // write into or delete each other's folder. prune removes a folder that a stop left.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let staging = versions.join(format!("{STAGING}{version}-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let mut archive = zip::ZipArchive::new(zip).map_err(io::Error::other)?;
         let entries = checked_entries(&mut archive, self.kind)?;
         if self.kind == Kind::Feature { memory::verify_install(&mut archive, version).map_err(io::Error::other)?; }
+        if self.kind == Kind::Module { module::verify_archive(&mut archive, version).map_err(io::Error::other)?; }
         for (i, (rel, is_dir)) in entries.into_iter().enumerate() {
             let path = staging.join(rel);
             if is_dir {
@@ -196,8 +255,17 @@ impl Install {
         }
         std::fs::File::create(staging.join(COMPLETE))?.write_all(version.as_bytes())?;
         let target = self.version_dir(version);
+        // Another unpack completed this version meanwhile (before or during the rename): keep
+        // it, as at the start, and drop this staging folder.
         if !target.exists() {
-            return rename_retry(&staging, &target);
+            return match std::fs::rename(&staging, &target) {
+                Err(_) if !repair && self.is_complete(version) => remove_dir(&staging),
+                Err(_) => rename_retry(&staging, &target),
+                ok => ok,
+            };
+        }
+        if !repair && self.is_complete(version) {
+            return remove_dir(&staging);
         }
         // A repair (the setup closed the app first): the old folder moves aside, the new one
         // takes its place, and the old one goes at the next prune. If the second rename fails
@@ -219,17 +287,38 @@ impl Install {
     /// activate() with no prune: a feature version that a running game still has loaded must
     /// stay until that game ends (the caller prunes then).
     pub fn activate_keep(&self, version: &str) -> io::Result<State> {
+        self.activate_with(version, true)
+    }
+
+    /// A recovery from a pulled version (the update endpoint's rollback flag): no version stays
+    /// as the previous, so "Switch to version" never offers a pulled one (live finding 3; the old
+    /// previous can be pulled too, Sol review r2). No prune: the pulled version runs now; the
+    /// prune of the next update removes it.
+    pub fn activate_dropping_active(&self, version: &str) -> io::Result<State> {
+        self.activate_with(version, false)
+    }
+
+    fn activate_with(&self, version: &str, keep_active: bool) -> io::Result<State> {
         if !self.is_complete(version) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("version {version} is not installed")));
         }
-        let old = self.state().ok().flatten();
+        // A state that does not read stops the switch: the prune after it would remove the
+        // version that it names (Sol r7 sweep). A damaged one names nothing; it is replaced.
+        let old = match self.state() {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => None,
+            Err(e) => return Err(e),
+        };
+        let old_active = old.as_ref().map(|s| s.active.clone());
         let previous = match old {
+            _ if !keep_active => None,
             Some(s) if s.active != version => Some(s.active),
             Some(s) => s.previous,
             None => None,
         };
+        let from = old_active.as_deref();
         let s = State { active: version.to_string(), previous: previous.filter(|p| self.is_complete(p)) };
-        self.switch_to(&s)?;
+        self.switch_to(&s, from)?;
         Ok(s)
     }
 
@@ -239,16 +328,24 @@ impl Install {
         let s = self.state()?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not installed"))?;
         let prev = s.previous.filter(|p| self.is_complete(p)).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no previous version"))?;
         let s = State { active: prev, previous: Some(s.active) };
-        self.switch_to(&s)?;
+        self.switch_to(&s, s.previous.as_deref())?;
         Ok(s)
     }
 
     /// Each package carries the launcher (fm_setup) of its version; it goes to the root before
-    /// the state switch, so launcher fixes reach members with updates. A version without one
-    /// (an old package) keeps the launcher that is there.
-    fn switch_to(&self, s: &State) -> io::Result<()> {
-        if self.kind == Kind::App {
-            self.copy_launcher(&s.active)?;
+    /// the state switch, so launcher fixes reach members with updates. A version without one (an
+    /// old package) keeps the launcher that is there. A switch to a version older than `from`
+    /// keeps the newer launcher (its uninstall fixes, Sol r6) and puts it in the target folder too,
+    /// because the older app's own switches copy the launcher of that folder (Sol r8).
+    fn switch_to(&self, s: &State, from: Option<&str>) -> io::Result<()> {
+        let back = from.is_some_and(|f| matches!((semver::Version::parse(&s.active), semver::Version::parse(f)), (Ok(to), Ok(f)) if to < f));
+        let name = fm_platform::install::launcher_name();
+        match (self.kind == Kind::App, back) {
+            (true, false) => {
+                self.copy_launcher(&s.active)?;
+            }
+            (true, true) if self.root.join(name).is_file() => fm_platform::files::write_replace(&self.version_dir(&s.active).join(name), &std::fs::read(self.root.join(name))?)?,
+            _ => {}
         }
         self.write_state(s)
     }
@@ -316,7 +413,31 @@ fn rename_retry(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-fn remove_dir(p: &Path) -> io::Result<()> {
+/// The paths in folder `dir`. A missing folder has none. Any other error of the folder or of
+/// one entry is returned, so a prune never acts on a part of the list (Sol r6 R6-1).
+pub(crate) fn entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let list = match std::fs::read_dir(dir) {
+        Ok(l) => l,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    list.map(|e| {
+        #[cfg(test)]
+        let e = tests::bad_entry(e);
+        Ok(e?.path())
+    })
+    .collect()
+}
+
+/// Removes a file. A file that is already gone is no error.
+pub(crate) fn remove_file(p: &Path) -> io::Result<()> {
+    match std::fs::remove_file(p) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn remove_dir(p: &Path) -> io::Result<()> {
     match std::fs::remove_dir_all(p) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -326,6 +447,18 @@ fn remove_dir(p: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Tests: the entry at this path does not read (Sol r6 R6-1, an entry error of read_dir).
+    thread_local! {
+        pub(crate) static BAD_ENTRY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn bad_entry(e: io::Result<std::fs::DirEntry>) -> io::Result<std::fs::DirEntry> {
+        match e {
+            Ok(d) if BAD_ENTRY.with(|b| b.borrow().as_deref() == Some(d.path().as_path())) => Err(io::Error::other("test: an entry that does not read")),
+            e => e,
+        }
+    }
 
     pub(crate) fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = io::Cursor::new(Vec::new());
@@ -359,6 +492,56 @@ mod tests {
         assert_eq!(i.rollback().unwrap().active, "1.2.0", "a second rollback goes forward");
         let (found, v) = Install::of_app_exe(&i.active_exe().unwrap()).unwrap();
         assert_eq!((found.root(), v.as_str()), (dir.path(), "1.2.0"));
+    }
+
+    #[test]
+    fn a_recovery_never_keeps_the_pulled_version_as_the_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = Install::new(dir.path());
+        for v in ["1.1.0", "1.2.0"] {
+            i.unpack(v, io::Cursor::new(app(v)), false).unwrap();
+            i.activate(v).unwrap();
+        }
+        // 1.2.0 pulled, recovery to the previous 1.1.0: no previous is left.
+        let s = i.activate_dropping_active("1.1.0").unwrap();
+        assert_eq!((s.active.as_str(), s.previous), ("1.1.0", None));
+        assert!(i.version_dir("1.2.0").exists(), "the running pulled version stays until a later prune");
+        // 1.2.0 and 1.1.0 both pulled, recovery to 1.0.0: 1.1.0 is not kept as the previous.
+        i.activate("1.2.0").unwrap();
+        i.unpack("1.0.0", io::Cursor::new(app("1.0.0")), false).unwrap();
+        let s = i.activate_dropping_active("1.0.0").unwrap();
+        assert_eq!((s.active.as_str(), s.previous), ("1.0.0", None));
+    }
+
+    // Sol r8 R8-2: a folder named like the marker is not a complete version, for complete()
+    // and is_complete() alike (one helper).
+    #[test]
+    fn a_folder_marker_is_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = Install::new(dir.path());
+        std::fs::create_dir_all(i.version_dir("1.0.0").join(COMPLETE)).unwrap();
+        assert!(!i.complete("1.0.0").unwrap() && !i.is_complete("1.0.0"));
+        i.unpack("1.0.0", io::Cursor::new(app("1.0.0")), true).unwrap();
+        assert!(i.complete("1.0.0").unwrap() && i.is_complete("1.0.0"));
+    }
+
+    // Sol r7 sweep: a state.json that does not read (delete share only, Windows: a replace still
+    // works) stops the switch. Before, the old active version was lost as the previous, and the
+    // prune after the switch removed it.
+    #[cfg(windows)]
+    #[test]
+    fn a_state_that_does_not_read_stops_the_switch() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let i = Install::new(dir.path());
+        for v in ["1.0.0", "1.1.0"] { i.unpack(v, io::Cursor::new(app(v)), false).unwrap(); }
+        i.activate_keep("1.0.0").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(4).open(dir.path().join(STATE)).unwrap();
+        assert!(i.activate("1.1.0").is_err());
+        drop(held);
+        assert!(i.is_complete("1.0.0"), "the active version stays");
+        i.activate("1.1.0").unwrap();
+        assert_eq!(i.state().unwrap().unwrap().previous.as_deref(), Some("1.0.0"));
     }
 
     /// The in-game hosts read the store with fm_feature_sdk::active::installed_versions (they do
@@ -401,7 +584,9 @@ mod tests {
         assert!(!i.is_complete("3.0.0") && i.activate("3.0.0").is_err());
         assert_eq!(i.state().unwrap().unwrap().active, "1.0.0");
         i.prune();
-        assert!(!i.version_dir("3.0.0").exists() && !dir.path().join("versions").join(".new-2.0.0").exists());
+        assert!(!i.version_dir("3.0.0").exists());
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("versions")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(names.iter().all(|n| !n.to_string_lossy().starts_with(STAGING)), "no staging folder stays: {names:?}");
     }
 
     #[test]
@@ -419,9 +604,10 @@ mod tests {
         assert_eq!(left, ["1.0.0"]);
     }
 
-    // The launcher in a package goes to the root at each switch (update and rollback).
+    // The launcher in a package goes to the root at each switch forward; a switch back keeps the
+    // newer launcher (its uninstall fixes, Sol review r6), also a recovery to an older version.
     #[test]
-    fn each_switch_installs_the_launcher_of_the_active_version() {
+    fn a_forward_switch_installs_the_launcher_and_a_switch_back_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
         let i = Install::new(dir.path());
         let name = fm_platform::install::launcher_name();
@@ -433,7 +619,17 @@ mod tests {
         let root_launcher = || std::fs::read_to_string(dir.path().join(name)).unwrap();
         assert_eq!(root_launcher(), "launcher 2.0.0");
         i.rollback().unwrap();
-        assert_eq!(root_launcher(), "launcher 1.0.0");
+        assert_eq!(root_launcher(), "launcher 2.0.0", "back to 1.0.0: the 2.0.0 launcher stays");
+        // The older app's own switch copies the launcher of its folder: now the newer one (Sol r8).
+        assert!(i.copy_launcher("1.0.0").unwrap());
+        assert_eq!(root_launcher(), "launcher 2.0.0");
+        i.rollback().unwrap();
+        assert_eq!(root_launcher(), "launcher 2.0.0");
+        i.activate_dropping_active("1.0.0").unwrap();
+        assert_eq!(root_launcher(), "launcher 2.0.0", "a recovery to an older version too");
+        i.unpack("3.0.0", io::Cursor::new(zip_of(&[(&app_exe_name(), b"a"), (name, b"launcher 3.0.0")])), false).unwrap();
+        i.activate_keep("3.0.0").unwrap();
+        assert_eq!(root_launcher(), "launcher 3.0.0");
     }
 
     // A feature store needs the manifest (not the app exe) and never copies a launcher.
@@ -499,6 +695,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(Install::new(dir.path()).unpack("../evil", io::Cursor::new(app("x")), false).is_err());
     }
+
+    // Sol r1 B3: unpacks of one version at the same time (two downloads of one module) each use
+    // their own staging folder. With one shared name, one unpack deleted or renamed the folder
+    // that the other still wrote. All must succeed, the version is complete, no staging stays.
+    #[test]
+    fn concurrent_unpacks_of_one_version_all_succeed() {
+        for _ in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let i = Install::new(dir.path());
+            let pkg = app("1.0.0");
+            let results: Vec<io::Result<()>> = std::thread::scope(|s| {
+                let runs: Vec<_> = (0..8).map(|_| s.spawn(|| i.unpack("1.0.0", io::Cursor::new(pkg.clone()), false))).collect();
+                runs.into_iter().map(|r| r.join().unwrap()).collect()
+            });
+            assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+            assert!(i.is_complete("1.0.0"));
+            let names: Vec<_> = std::fs::read_dir(dir.path().join(VERSIONS)).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(names, ["1.0.0"], "no staging folder stays");
+        }
+    }
 }
 
 /// Exit codes of `fm_app --fm-uninstall` (the game-file cleanup), read by the uninstaller.
@@ -513,6 +729,9 @@ pub mod cleanup {
     pub const CHANGED_KEPT: i32 = 3;
     /// The argument that runs the cleanup.
     pub const FLAG: &str = "--fm-uninstall";
+    /// After FLAG: the uninstall also deletes the app data, so the cleanup also ends the account
+    /// session (revoke, credential deleted). An older app ignores it and only cleans up.
+    pub const DELETE_DATA: &str = "--delete-data";
     /// The argument that makes a running app quit (setup, uninstall).
     pub const QUIT: &str = "--fm-quit";
 }

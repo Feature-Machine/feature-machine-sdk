@@ -1,7 +1,7 @@
 // OS layer. Other crates ask this crate for OS locations and game installs, so they stay free
 // of OS code. App folders live in fm_paths (re-exported here), so in-game plugins can use them
 // without game detection.
-pub use fm_paths::{data_dir, features_dir, logs_dir, APP_ID};
+pub use fm_paths::{data_dir, data_dir_override, features_dir, isolate_from_env, logs_dir, APP_ID, DATA_DIR_ENV};
 
 pub mod files;
 pub mod feature_parts;

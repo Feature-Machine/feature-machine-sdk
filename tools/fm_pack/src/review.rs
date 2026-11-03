@@ -2,7 +2,7 @@
 // review/policy.md and review/verdict.schema.json (made from `Verdict`; a test keeps them equal),
 // then runs `fm_pack review-brief <build dir> <verdict.json>`. A verdict that passes the schema
 // type and the checks against the built package becomes the public safety brief (approve) or the
-// creator's review notes (deny). The model call itself stays in the job.
+// creator's review notes (deny), with the dependency decisions of `fm_pack deps` (deps.rs).
 use fm_install::feature::{Capability, Manifest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,10 +27,27 @@ pub struct Verdict {
     pub powers: Vec<PowerUse>,
     /// One line for each capability in feature.json, for the member.
     pub brief: Vec<BriefLine>,
-    /// Short notes for the public quality score; never a reason to deny.
+    /// Short notes for the admin, not for members or the creator; never a reason to deny.
     pub quality: Vec<String>,
     /// Risks that the reviewer checked and found safe.
     pub cleared: Vec<String>,
+    /// One row for each dependency that the review read (not creator code): the powers of its
+    /// own code. The dependency ledger keeps them (plan S2 step 2), so a later feature that uses
+    /// the same code is judged by them without a new read.
+    pub dependencies: Vec<DependencyUse>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyUse {
+    /// The name and version of a `read` package of dependencies.json.
+    pub name: String,
+    pub version: String,
+    /// The capabilities of feature.json that its code needs (for example "direct_network");
+    /// empty when it needs none.
+    pub powers: Vec<String>,
+    /// The hosts, programs, registry keys and files that its code reaches; empty when none.
+    pub reaches: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -108,7 +125,8 @@ impl Verdict {
             .chain(self.findings.iter().flat_map(|f| [&f.file, &f.power, &f.what, &f.why]))
             .chain(self.powers.iter().flat_map(|p| [&p.power, &p.declared, &p.used]))
             .chain(self.brief.iter().flat_map(|b| [&b.capability, &b.text]))
-            .chain(&self.quality).chain(&self.cleared);
+            .chain(&self.quality).chain(&self.cleared)
+            .chain(self.dependencies.iter().flat_map(|d| [&d.name, &d.version].into_iter().chain(&d.powers).chain(&d.reaches)));
         for t in texts {
             let start = t.chars().take(60).collect::<String>();
             if t.trim().is_empty() || t.chars().count() > MAX_TEXT || t.chars().any(char::is_control) {
@@ -142,17 +160,47 @@ impl Verdict {
                 bad.push(format!("brief: no line for {}", serde_json::to_value(c).map(|v| v.to_string()).unwrap_or_default()));
             }
         }
+        for d in &self.dependencies {
+            for p in &d.powers {
+                if matches!(serde_json::from_value::<Capability>(serde_json::Value::String(p.clone())), Err(_) | Ok(Capability::Unknown)) { bad.push(format!("dependencies: {} {}: {p} is not a capability name", d.name, d.version)); }
+            }
+        }
         match bad.is_empty() {
             true => Ok(()),
             false => Err(bad.join("; ")),
         }
     }
 
-    /// The public safety brief (approve) or the creator's review notes (deny), in Markdown. Only
+    /// The dependency rows against dependencies.json: exactly one row for each package that the
+    /// review read and that is not creator code, and no other row. The ledger keys its entries by
+    /// these packages, so a missing or invented row would record wrong powers (plan S2 step 2).
+    pub fn check_dependencies(&self, deps: &crate::deps::Dependencies) -> Result<(), String> {
+        use crate::deps::{Basis, Kind};
+        let want: Vec<(&str, &str)> = deps.packages.iter().filter(|c| c.basis == Basis::Read && c.package.kind != Kind::Creator)
+            .map(|c| (c.package.name.as_str(), c.package.version.as_str())).collect();
+        let mut bad = Vec::new();
+        for (n, v) in &want {
+            match self.dependencies.iter().filter(|d| (d.name.as_str(), d.version.as_str()) == (*n, *v)).count() {
+                1 => {}
+                0 => bad.push(format!("dependencies: no row for {n} {v}")),
+                _ => bad.push(format!("dependencies: {n} {v} twice")),
+            }
+        }
+        for d in self.dependencies.iter().filter(|d| !want.contains(&(d.name.as_str(), d.version.as_str()))) {
+            bad.push(format!("dependencies: {} {} is not a read dependency of dependencies.json", d.name, d.version));
+        }
+        match bad.is_empty() {
+            true => Ok(()),
+            false => Err(bad.join("; ")),
+        }
+    }
+
+    /// The public safety brief (approve) or the admin review notes (deny), in Markdown. Only
     /// the title is Markdown; all model and manifest text is in one fenced text block, which
     /// GitHub and CommonMark show as written: no link (also no autolink of a URL, host or email),
-    /// no HTML, no formatting. The commit and SHA-256 come from build.json.
-    pub fn render(&self, m: &Manifest, commit: &str, sha256: &str) -> String {
+    /// no HTML, no formatting. The commit and SHA-256 come from build.json; `supply` holds the
+    /// lines of `supply_lines` (what the review read, what reputation accepted).
+    pub fn render(&self, m: &Manifest, commit: &str, sha256: &str, supply: &[String]) -> String {
         let mut b = Vec::new();
         let list = |b: &mut Vec<String>, title: &str, items: &[String]| {
             if items.is_empty() { return; }
@@ -187,8 +235,16 @@ impl Verdict {
                 "Review notes"
             }
         };
-        list(&mut b, "Quality notes", &self.quality);
-        list(&mut b, "Cleared risks", &self.cleared);
+        if !supply.is_empty() {
+            b.push(String::new());
+            b.extend(supply.iter().cloned());
+        }
+        // Quality notes and cleared risks are a free code review, so only the admin notes of a
+        // deny hold them; the public brief does not (creator feedback plan F1, 2026-11-02).
+        if self.verdict == Decision::Deny {
+            list(&mut b, "Quality notes", &self.quality);
+            list(&mut b, "Cleared risks", &self.cleared);
+        }
         fenced(title, &b)
     }
 }
@@ -206,7 +262,7 @@ fn fenced(title: &str, lines: &[String]) -> String {
 /// The folders of this machine that a public text must not name: home, temp, the current
 /// folder, the runner and the cargo folders. This exact check is the guarantee against the
 /// paths of the machine that runs the review; the `not_public` patterns also catch others.
-fn machine_roots() -> Vec<String> {
+pub(crate) fn machine_roots() -> Vec<String> {
     let vars = ["USERPROFILE", "HOME", "TEMP", "TMP", "TMPDIR", "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "GITHUB_WORKSPACE", "CARGO_HOME", "RUSTUP_HOME"];
     roots_of(vars.iter().filter_map(std::env::var_os).map(std::path::PathBuf::from).chain(std::env::current_dir().ok()))
 }
@@ -285,28 +341,119 @@ fn not_public(t: &str) -> Option<&'static str> {
     local.then_some("a local path")
 }
 
+/// What the brief says about the code of the build (submission review plan R1 to R8): the code
+/// that the review read, the code that an earlier approved review read (with its recorded
+/// powers, S2 step 5), the SDK, the crates.io crates that reputation accepted, and each
+/// closed-source part with its publisher. All facts come from build.json and dependencies.json.
+fn supply_lines(deps: &crate::deps::Dependencies, sdk: &serde_json::Value, binaries: &[crate::deps::Binary], prebuilt: &[crate::deps::Prebuilt]) -> Vec<String> {
+    use crate::deps::{Basis, Kind};
+    let mut b = vec!["Code that the review read:".to_string()];
+    for c in deps.packages.iter().filter(|c| c.basis == Basis::Read) {
+        let p = &c.package;
+        let again = if c.re_review { "; Feature Machine asked for a new full read" } else { "" };
+        b.push(match p.kind {
+            Kind::Creator => format!("- {} {} in {}", p.name, p.version, p.source.as_deref().unwrap_or(".")),
+            Kind::Git => format!("- {} {} from {}", p.name, p.version, p.source.as_deref().unwrap_or("git")),
+            _ => match &c.previous {
+                Some(e) => format!("- {} {} from crates.io: {}; the changes since {} (an earlier approved review read {})", p.name, p.version, c.why.join("; "), e.version, e.version),
+                None => format!("- {} {} from crates.io: {}", p.name, p.version, c.why.join("; ")),
+            },
+        } + again);
+    }
+    let earlier: Vec<String> = deps.packages.iter().filter(|c| c.basis == Basis::Reviewed).map(|c| {
+        let p = &c.package;
+        let from = if p.kind == Kind::Git { p.source.as_deref().unwrap_or("git") } else { "crates.io" };
+        let powers = c.ledger.as_ref().map(|e| e.powers.join(", ")).filter(|s| !s.is_empty()).unwrap_or_else(|| "no power".into());
+        format!("- {} {} from {from}: {powers}", p.name, p.version)
+    }).collect();
+    if !earlier.is_empty() {
+        b.push("Code that an earlier approved review read, with the powers that its code needs:".into());
+        b.extend(earlier);
+    }
+    b.push(match sdk["tag"].as_str() {
+        Some(tag) => format!("Feature Machine SDK: {tag}."),
+        None => "Feature Machine SDK: the local SDK of this repository.".into(),
+    });
+    let known: Vec<String> = deps.packages.iter().filter(|c| c.basis == Basis::Reputation).map(|c| format!("{} {}", c.package.name, c.package.version)).collect();
+    match known.is_empty() {
+        true => b.push("Open-source crates accepted by crates.io reputation: none.".into()),
+        false => b.push(format!("Open-source crates accepted by crates.io reputation ({}): {}.", known.len(), known.join(", "))),
+    }
+    let closed: Vec<String> = binaries.iter().map(|x| format!("- {} {} from {} (SHA-256 {})", x.file, x.version, x.publisher, x.sha256))
+        .chain(prebuilt.iter().map(|x| {
+            // Why it ships (R19): the reputation of its crate, else an approval (prebuilt_check).
+            let known = deps.packages.iter().any(|c| c.basis == Basis::Reputation && c.package.kind == Kind::CratesIo && c.package.name == x.name && c.package.version == x.version);
+            format!("- {} in {} (SHA-256 {}), {}", x.file, x.publisher(), x.sha256, if known { "with the reputation of its crate" } else { "approved by Feature Machine" })
+        })).collect();
+    match closed.is_empty() {
+        true => b.push("Closed-source parts: none.".into()),
+        false => b.extend(std::iter::once("Closed-source parts:".to_string()).chain(closed)),
+    }
+    b
+}
+
+/// The decisions of dependencies.json for the packages of build.json: the same list, each
+/// decision equal to `deps::decide` on its stored facts and date (a changed file shows), and
+/// none refused.
+fn checked_deps(dir: &Path, record: &serde_json::Value) -> Result<crate::deps::Dependencies, String> {
+    let file = dir.join("dependencies.json");
+    let deps: crate::deps::Dependencies = serde_json::from_slice(&std::fs::read(&file).map_err(|e| format!("{}: {e} (run fm_pack deps first)", file.display()))?).map_err(|e| format!("dependencies.json: {e}"))?;
+    let packages: Vec<crate::deps::Package> = serde_json::from_value(record["packages"].clone()).map_err(|e| format!("build.json packages: {e}"))?;
+    if deps.packages.iter().map(|c| &c.package).ne(packages.iter()) { return Err("dependencies.json is not for the packages of build.json; run fm_pack deps again".into()); }
+    let at = time::OffsetDateTime::parse(&deps.checked, &time::format_description::well_known::Rfc3339).map_err(|e| format!("dependencies.json checked: {e}"))?;
+    for c in &deps.packages {
+        if crate::deps::decide(&c.package, c.facts.as_ref(), c.ledger.as_ref(), at) != (c.basis, c.why.clone()) || (c.ledger.is_some() && c.basis != crate::deps::Basis::Reviewed) { return Err(format!("dependencies.json: the decision for {} {} does not follow from its facts", c.package.name, c.package.version)); }
+        if c.basis == crate::deps::Basis::Refused { return Err(format!("dependencies.json refuses {} {}: {}", c.package.name, c.package.version, c.why.join("; "))); }
+        if c.re_review && (c.previous.is_some() || c.ledger.is_some()) { return Err(format!("dependencies.json: {} {} is marked for a new read but has a ledger base", c.package.name, c.package.version)); }
+        if let Some(e) = &c.previous {
+            if crate::deps::diff_base(&c.package, c.facts.as_ref(), c.basis, std::slice::from_ref(e)) != Some(e) { return Err(format!("dependencies.json: {} {} cannot have a diff read from {}", c.package.name, c.package.version, e.version)); }
+        }
+    }
+    Ok(deps)
+}
+
 /// fm_pack review-brief <build dir> <verdict.json>: the package must still be the one in
-/// build.json (SHA-256), and the verdict must pass `check` for its manifest. Writes
-/// safety-brief.md or review-notes.md next to build.json and prints the verdict and the file.
+/// build.json (SHA-256), dependencies.json must hold its decisions (`checked_deps`), and the
+/// verdict must pass `check` for its manifest. Writes safety-brief.md or review-notes.md next
+/// to build.json and prints the verdict and the file. With prepare.json (the review job), the
+/// facts come from it, and build.json, which a runner with creator code wrote, must repeat them.
 pub fn command(dir: &str, verdict: &str) -> Result<(), String> {
     let dir = Path::new(dir);
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
-    let record: serde_json::Value = serde_json::from_slice(&read(&dir.join("build.json"))?).map_err(|e| format!("build.json: {e}"))?;
+    let built: serde_json::Value = serde_json::from_slice(&read(&dir.join("build.json"))?).map_err(|e| format!("build.json: {e}"))?;
+    let record = crate::build::facts_record(dir)?;
+    if let Some(key) = crate::build::FACTS.into_iter().find(|k| built[*k] != record[*k]) {
+        return Err(format!("build.json does not have the {key} of {}", crate::build::PREPARED));
+    }
     let hex = |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())).map(String::from);
-    let (commit, sha256) = (hex(&record["commit"]).ok_or("build.json: no commit")?, hex(&record["package"]["sha256"]).ok_or("build.json: no package sha256")?);
-    let file = record["package"]["file"].as_str().filter(|f| fm_install::feature::safe_rel(f).is_ok()).ok_or("build.json: no package file")?;
+    let (commit, sha256) = (hex(&record["commit"]).ok_or("no commit in the facts")?, hex(&built["package"]["sha256"]).ok_or("build.json: no package sha256")?);
+    let file = built["package"]["file"].as_str().filter(|f| fm_install::feature::safe_rel(f).is_ok()).ok_or("build.json: no package file")?;
     let bytes = read(&dir.join(file))?;
     if crate::sha256_hex(&bytes) != sha256 { return Err(format!("{file} is not the package of build.json (SHA-256)")); }
     let (m, _) = fm_install::feature::inspect(std::io::Cursor::new(&bytes)).map_err(|e| e.to_string())?;
+    // The consent of the member and the verdict are for the feature.json of the commit; build code
+    // can change the tree before the pack (review r1 B5).
+    if serde_json::to_value(&m).map_err(|e| e.to_string())? != record["manifest"] { return Err(format!("the feature.json of {file} is not the feature.json of the commit")); }
     let v: Verdict = serde_json::from_slice(&read(Path::new(verdict))?).map_err(|e| format!("{verdict}: {e}"))?;
-    v.check(&m, &machine_roots()).map_err(|e| format!("{verdict}: {e}"))?;
+    let machine = machine_roots();
+    v.check(&m, &machine).map_err(|e| format!("{verdict}: {e}"))?;
+    let deps = checked_deps(dir, &record)?;
+    v.check_dependencies(&deps).map_err(|e| format!("{verdict}: {e}"))?;
+    let binaries: Vec<crate::deps::Binary> = serde_json::from_value(record["binaries"].clone()).map_err(|e| format!("build.json binaries: {e}"))?;
+    let prebuilt: Vec<crate::deps::Prebuilt> = serde_json::from_value(record["prebuilt"].clone()).map_err(|e| format!("build.json prebuilt: {e}"))?;
+    crate::deps::prebuilt_check(&deps.packages, &prebuilt)?;
+    let supply = supply_lines(&deps, &record["sdk"], &binaries, &prebuilt);
+    // Folder names of the creator's repository are public in these lines too (as the name).
+    for line in &supply {
+        if machine.iter().any(|r| names_root(&normal(line), r)) || not_public(line).is_some() { return Err(format!("a dependency line names a local path: {line:?}")); }
+    }
     let (name, other) = match v.verdict { Decision::Approve => ("safety-brief.md", "review-notes.md"), Decision::Deny => ("review-notes.md", "safety-brief.md") };
     // The newest verdict is the only result: a deny after an approve must not leave the public brief.
     match std::fs::remove_file(dir.join(other)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{other}: {e}")),
         _ => {}
     }
-    std::fs::write(dir.join(name), v.render(&m, &commit, &sha256)).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(name), v.render(&m, &commit, &sha256, &supply)).map_err(|e| e.to_string())?;
     println!("{}", serde_json::json!({ "verdict": v.verdict, "file": dir.join(name) }));
     Ok(())
 }
@@ -317,8 +464,29 @@ mod tests {
     const EXAMPLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/review/examples");
 
     /// The answer format for the model, as review/verdict.schema.json holds it.
+    /// Subschemas inline: OpenAI strict mode refuses a "$ref" with other keys next to it, such
+    /// as the field description (live OpenRouter call, 2026-11-01).
     fn schema() -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(Verdict)).expect("a schema is JSON")
+        let generator = schemars::generate::SchemaSettings::draft2020_12().with(|s| s.inline_subschemas = true).into_generator();
+        serde_json::to_value(generator.into_root_schema_for::<Verdict>()).expect("a schema is JSON")
+    }
+
+    /// The strict structured output rules: no "$ref", and each object lists every property as
+    /// required and allows no other property.
+    fn strict_problems(v: &serde_json::Value, at: &str, bad: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(o) => {
+                if o.contains_key("$ref") { bad.push(format!("{at}: $ref")); }
+                if let Some(props) = o.get("properties").and_then(|p| p.as_object()) {
+                    let required: Vec<&str> = o.get("required").and_then(|r| r.as_array()).into_iter().flatten().filter_map(|r| r.as_str()).collect();
+                    if props.keys().any(|k| !required.contains(&k.as_str())) { bad.push(format!("{at}: a property is not required")); }
+                    if o.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) { bad.push(format!("{at}: additionalProperties is not false")); }
+                }
+                for (k, x) in o { strict_problems(x, &format!("{at}/{k}"), bad); }
+            }
+            serde_json::Value::Array(a) => for (i, x) in a.iter().enumerate() { strict_problems(x, &format!("{at}/{i}"), bad); },
+            _ => {}
+        }
     }
 
     fn example(name: &str) -> (Verdict, Manifest) {
@@ -336,8 +504,9 @@ mod tests {
         let want = serde_json::to_string_pretty(&schema()).unwrap() + "\n";
         if std::env::var_os("FM_UPDATE_SCHEMA").is_some() { std::fs::write(&path, &want).unwrap(); }
         assert_eq!(std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n"), want, "run FM_UPDATE_SCHEMA=1 cargo test -p fm_pack review");
-        let s = schema();
-        assert_eq!(s["additionalProperties"], false, "the model must not add fields");
+        let mut bad = vec![];
+        strict_problems(&schema(), "", &mut bad);
+        assert!(bad.is_empty(), "the model call uses strict mode: {bad:?}");
     }
 
     // The three simulated reviews of 2026-10-24 (model runs 08:54, 08:54 and 09:39), written
@@ -349,7 +518,7 @@ mod tests {
             let (v, m) = example(name);
             v.check(&m, &[]).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(v.verdict, decision, "{name}");
-            let text = v.render(&m, "abc123", "def456");
+            let text = v.render(&m, "abc123", "def456", &[]);
             assert!(text.contains(if decision == Decision::Approve { "# Safety brief" } else { "# Review notes" }), "{name}");
         }
     }
@@ -382,6 +551,88 @@ mod tests {
         let (mut v, m) = example("live-weather-0.1.7");
         v.findings[0].file = "F:/repo/features/live_weather/src/profile.rs".into();
         assert!(v.check(&m, &[]).unwrap_err().contains("not relative"));
+        let (mut v, m) = example("trip-0.2.1");
+        v.dependencies.push(DependencyUse { name: "x".into(), version: "1.0.0".into(), powers: vec!["net_raw".into()], reaches: vec![] });
+        assert!(v.check(&m, &[]).unwrap_err().contains("net_raw is not a capability name"));
+        v.dependencies[0].powers = vec!["direct_network".into()];
+        v.dependencies[0].reaches = vec!["/home/reviewer/x".into()];
+        assert!(v.check(&m, &[]).unwrap_err().contains("a local path"));
+    }
+
+    // S2 step 5: a reviewed package needs no row (the ledger has its powers), the brief names it
+    // with the recorded powers, and dependencies.json cannot keep an entry that did not decide.
+    #[test]
+    fn reviewed_packages_show_their_ledger_powers() {
+        use crate::deps::{Basis, Checked, Dependencies, Entry, Kind, Package};
+        let sum = "a".repeat(64);
+        let p = Package { name: "small".into(), version: "1.0.0".into(), kind: Kind::CratesIo, source: None, checksum: Some(sum.clone()) };
+        let entry = Entry { kind: Kind::CratesIo, name: "small".into(), version: "1.0.0".into(), source: sum, powers: vec!["direct_network".into()], reaches: vec!["api.example.com".into()], run: "940".into() };
+        let deps = Dependencies { checked: "2026-11-01T00:00:00Z".into(), packages: vec![Checked { package: p, basis: Basis::Reviewed, why: vec![], facts: None, ledger: Some(entry), previous: None, re_review: false }] };
+        let (mut v, _) = example("trip-0.2.1");
+        v.dependencies = vec![];
+        v.check_dependencies(&deps).unwrap();
+        let lines = supply_lines(&deps, &serde_json::json!({ "tag": "sdk-v1" }), &[], &[]);
+        assert!(lines.iter().any(|l| l == "- small 1.0.0 from crates.io: direct_network"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("small") && l.contains("reputation")), "{lines:?}");
+    }
+
+    // S2 step 5: review-brief recomputes each decision with its ledger entry: a reviewed package
+    // passes, an entry on a package that its facts make `read` is refused, and so is an entry of
+    // other code (a changed dependencies.json shows).
+    #[test]
+    fn checked_deps_holds_the_ledger_to_the_decision() {
+        use crate::deps::{Basis, Checked, Dependencies, Entry, Facts, Kind, Package};
+        let sum = "a".repeat(64);
+        let p = Package { name: "small".into(), version: "1.0.0".into(), kind: Kind::CratesIo, source: None, checksum: Some(sum.clone()) };
+        let entry = Entry { kind: Kind::CratesIo, name: "small".into(), version: "1.0.0".into(), source: sum, powers: vec![], reaches: vec![], run: "940".into() };
+        let facts = Facts { downloads: 10, published: "2026-01-01T00:00:00Z".into(), version_published: "2026-01-01T00:00:00Z".into(), yanked: false, advisories: vec![] };
+        let why = vec!["10 downloads (floor 10000)".to_string()];
+        let record = serde_json::json!({ "packages": [p] });
+        let t = tempfile::tempdir().unwrap();
+        let try_marked = |basis, ledger: Option<Entry>, previous: Option<Entry>, re_review| {
+            let deps = Dependencies { checked: "2026-11-01T00:00:00Z".into(), packages: vec![Checked { package: p.clone(), basis, why: why.clone(), facts: Some(facts.clone()), ledger, previous, re_review }] };
+            std::fs::write(t.path().join("dependencies.json"), serde_json::to_vec(&deps).unwrap()).unwrap();
+            checked_deps(t.path(), &record).map(|_| ())
+        };
+        let try_full = |basis, ledger, previous| try_marked(basis, ledger, previous, false);
+        let try_with = |basis, ledger| try_full(basis, ledger, None);
+        // Cloud review r2: code marked for a new read has no ledger base (R17).
+        try_marked(Basis::Read, None, None, true).unwrap();
+        assert!(try_marked(Basis::Read, None, Some(Entry { version: "0.9.0".into(), ..entry.clone() }), true).unwrap_err().contains("marked for a new read"));
+        assert!(try_marked(Basis::Reviewed, Some(entry.clone()), None, true).unwrap_err().contains("marked for a new read"));
+        // S2 step 6: a diff base only on a read crate, and only of an older version.
+        let older = Entry { version: "0.9.0".into(), ..entry.clone() };
+        try_full(Basis::Read, None, Some(older.clone())).unwrap();
+        assert!(try_full(Basis::Read, None, Some(entry.clone())).unwrap_err().contains("diff read"));
+        assert!(try_full(Basis::Reviewed, Some(entry.clone()), Some(older)).unwrap_err().contains("diff read"));
+        try_with(Basis::Reviewed, Some(entry.clone())).unwrap();
+        try_with(Basis::Read, None).unwrap();
+        assert!(try_with(Basis::Read, Some(entry.clone())).unwrap_err().contains("does not follow"));
+        assert!(try_with(Basis::Reviewed, None).unwrap_err().contains("does not follow"));
+        assert!(try_with(Basis::Reviewed, Some(Entry { source: "b".repeat(64), ..entry })).unwrap_err().contains("does not follow"));
+    }
+
+    // S2 step 2: one row for each read dependency that is not creator code, and no other.
+    #[test]
+    fn the_dependency_rows_match_the_read_packages() {
+        use crate::deps::{Basis, Checked, Dependencies, Kind, Package};
+        let pkg = |name: &str, kind| Package { name: name.into(), version: "1.0.0".into(), kind, source: None, checksum: None };
+        let checked = |p, basis| Checked { package: p, basis, why: vec![], facts: None, ledger: None, previous: None, re_review: false };
+        let deps = Dependencies { checked: "2026-11-01T00:00:00Z".into(), packages: vec![
+            checked(pkg("mine", Kind::Creator), Basis::Read), checked(pkg("small", Kind::CratesIo), Basis::Read),
+            checked(pkg("gitdep", Kind::Git), Basis::Read), checked(pkg("serde", Kind::CratesIo), Basis::Reputation)] };
+        let row = |n: &str| DependencyUse { name: n.into(), version: "1.0.0".into(), powers: vec![], reaches: vec![] };
+        let (mut v, _) = example("trip-0.2.1");
+        v.dependencies = vec![row("small"), row("gitdep")];
+        v.check_dependencies(&deps).unwrap();
+        v.dependencies = vec![row("small")];
+        assert!(v.check_dependencies(&deps).unwrap_err().contains("no row for gitdep 1.0.0"));
+        v.dependencies = vec![row("small"), row("gitdep"), row("small")];
+        assert!(v.check_dependencies(&deps).unwrap_err().contains("small 1.0.0 twice"));
+        for extra in ["serde", "mine", "invented"] {
+            v.dependencies = vec![row("small"), row("gitdep"), row(extra)];
+            assert!(v.check_dependencies(&deps).unwrap_err().contains(&format!("{extra} 1.0.0 is not a read dependency")), "{extra}");
+        }
     }
 
     // A local path shows the reviewer's PC: such text in any field sends the verdict back, also
@@ -455,7 +706,7 @@ mod tests {
         let (mut v, mut m) = example("trip-0.2.1");
         m.name = "Trip\n# Hi ````` www.evil.example".into();
         v.brief[0].text = "Click [here](https://evil.example) <script>x</script> ```` help@evil.example".into();
-        let text = v.render(&m, "abc", "def");
+        let text = v.render(&m, "abc", "def", &[]);
         let lines: Vec<&str> = text.lines().collect();
         let fence = "`".repeat(6) + "text";
         assert_eq!(lines[..3], ["# Safety brief", "", fence.as_str()], "{text}");
@@ -481,14 +732,39 @@ mod tests {
         let zip = t.path().join("trip-0.2.1.zip");
         fm_install::feature::pack(&src, &[lib], &mut std::fs::File::create(&zip).unwrap()).unwrap();
         let sha = crate::sha256_hex(&std::fs::read(&zip).unwrap());
-        let record = serde_json::json!({ "commit": "0123abcd", "package": { "file": "trip-0.2.1.zip", "sha256": sha } });
+        let packages = serde_json::json!([
+            { "name": "fm_trip", "version": "0.2.1", "kind": "creator", "source": "features/trip" },
+            { "name": "serde", "version": "1.0.229", "kind": "crates_io" },
+        ]);
+        let record = serde_json::json!({ "commit": "0123abcd", "package": { "file": "trip-0.2.1.zip", "sha256": sha }, "manifest": m, "sdk": null, "packages": packages, "binaries": [],
+            "prebuilt": [{ "name": "serde", "version": "1.0.229", "file": "lib/x.lib", "sha256": "ab" }] });
         std::fs::write(t.path().join("build.json"), record.to_string()).unwrap();
         let verdict = t.path().join("verdict.json");
         std::fs::write(&verdict, serde_json::to_vec(&v).unwrap()).unwrap();
         let (d, vs) = (t.path().to_string_lossy().into_owned(), verdict.to_string_lossy().into_owned());
+        // No dependencies.json: no brief (the gate comes first, submission review plan R3).
+        assert!(command(&d, &vs).unwrap_err().contains("run fm_pack deps first"));
+        let facts = serde_json::json!({ "downloads": 900_000_000u64, "published": "2015-01-01T00:00:00Z", "version_published": "2026-09-01T00:00:00Z", "yanked": false, "advisories": [] });
+        let deps = |serde_basis: &str, why: serde_json::Value| serde_json::json!({ "checked": "2026-10-29T12:00:00Z", "packages": [
+            { "package": packages[0], "basis": "read", "why": [] },
+            { "package": packages[1], "basis": serde_basis, "why": why, "facts": facts },
+        ] }).to_string();
+        let deps_file = t.path().join("dependencies.json");
+        std::fs::write(&deps_file, deps("read", serde_json::json!(["x"]))).unwrap();
+        assert!(command(&d, &vs).unwrap_err().contains("does not follow from its facts"), "an edited decision");
+        let gone = serde_json::json!({ "checked": "2026-10-29T12:00:00Z", "packages": [
+            { "package": packages[0], "basis": "read", "why": [] },
+            { "package": packages[1], "basis": "refused", "why": ["not on crates.io"] },
+        ] });
+        std::fs::write(&deps_file, gone.to_string()).unwrap();
+        assert!(command(&d, &vs).unwrap_err().contains("refuses serde 1.0.229"));
+        std::fs::write(&deps_file, deps("reputation", serde_json::json!([]))).unwrap();
         command(&d, &vs).unwrap();
         let brief = std::fs::read_to_string(t.path().join("safety-brief.md")).unwrap();
         assert!(brief.contains("commit 0123abcd.") && brief.contains(&format!("SHA-256 {sha}.")) && brief.contains("\n- vars_read: "), "{brief}");
+        // The public brief is no code review: quality notes and cleared risks stay with the admin.
+        assert!(!brief.contains("Quality notes:") && !brief.contains("Cleared risks:") && !brief.contains("lib.rs:97"), "{brief}");
+        assert!(brief.contains("Code that the review read:\n- fm_trip 0.2.1 in features/trip\nFeature Machine SDK: the local SDK of this repository.\nOpen-source crates accepted by crates.io reputation (1): serde 1.0.229.\nClosed-source parts:\n- lib/x.lib in crates.io serde 1.0.229 (SHA-256 ab), with the reputation of its crate"), "{brief}");
         let (other, _) = example("live-weather-0.1.7");
         std::fs::write(&verdict, serde_json::to_vec(&other).unwrap()).unwrap();
         assert!(command(&d, &vs).unwrap_err().contains("the verdict is for live-weather"));
@@ -496,12 +772,19 @@ mod tests {
         (deny.verdict, deny.findings) = (Decision::Deny, other.findings);
         std::fs::write(&verdict, serde_json::to_vec(&deny).unwrap()).unwrap();
         command(&d, &vs).unwrap();
-        assert!(std::fs::read_to_string(t.path().join("review-notes.md")).unwrap().contains("# Review notes\n\n```text\nTrip 0.2.1: denied."));
+        let notes = std::fs::read_to_string(t.path().join("review-notes.md")).unwrap();
+        assert!(notes.contains("# Review notes\n\n```text\nTrip 0.2.1: denied."), "{notes}");
+        assert!(notes.contains("\nQuality notes:\n- features/trip/src/lib.rs:97: ") && notes.contains("\nCleared risks:\n- "), "the admin notes keep them: {notes}");
         // The newest verdict is the only result, in both directions (review R1-B4).
         assert!(!t.path().join("safety-brief.md").exists(), "a deny left the public brief");
         std::fs::write(&verdict, serde_json::to_vec(&v).unwrap()).unwrap();
         command(&d, &vs).unwrap();
         assert!(t.path().join("safety-brief.md").exists() && !t.path().join("review-notes.md").exists());
+        let mut changed = record.clone();
+        changed["manifest"]["version"] = "9.9.9".into();
+        std::fs::write(t.path().join("build.json"), changed.to_string()).unwrap();
+        assert!(command(&d, &vs).unwrap_err().contains("is not the feature.json of the commit"));
+        std::fs::write(t.path().join("build.json"), record.to_string()).unwrap();
         std::fs::write(&zip, b"other bytes").unwrap();
         std::fs::write(&verdict, serde_json::to_vec(&v).unwrap()).unwrap();
         assert!(command(&d, &vs).unwrap_err().contains("not the package of build.json"));

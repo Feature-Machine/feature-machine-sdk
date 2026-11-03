@@ -101,7 +101,8 @@ pub trait Backend: Send + Sync + 'static {
     /// so the feature id names the activation in `stopping` and `stopped` (plan 12.2, contract 1).
     fn cleanup(&self, _feature: &str, _activation: u64) -> Result<(), String> { Ok(()) }
     /// The user folder of `game` for the user files service (files.rs): the default folder. A
-    /// host refuses (Err, logged) when the game uses another folder that hooks cannot know.
+    /// host gives another folder only when it proved that the game uses it (ATS -homedir); the
+    /// report carries it to the app for the exit hook. Err (logged): no user files. Keep the answer.
     fn user_root(&self, game: &str) -> Result<std::path::PathBuf, String> {
         crate::files::default_user_root(game).ok_or_else(|| format!("{game} has no user folder in Feature Machine"))
     }
@@ -249,6 +250,9 @@ struct Ctx {
     held: Mutex<(Vec<Held>, Option<Instant>)>,
     /// The declared game files (capability user_files).
     user_files: Vec<crate::UserFile>,
+    /// HostApi::settings points here: the projection at this start (API 6; "{}" otherwise).
+    settings: String,
+    settings_revision: u64,
 }
 
 /// A file's modification time and size: a new compile changes at least one of them.
@@ -310,6 +314,28 @@ enum Open {
     Cleaned(String),
 }
 
+pub use crate::active::PageTarget;
+
+/// A message of the app for one feature that a host gives on its feature thread (app_message).
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppMessage {
+    /// From the feature's page or a widget action: a topic and JSON text (FeatureSet::page
+    /// checks both). `target`: only that start of the feature may get it.
+    Page { topic: String, data: String, target: Option<PageTarget> },
+    /// The settings projection of one version at a revision (FeatureSet::settings).
+    Settings { version: String, revision: u64, values: String },
+}
+
+impl AppMessage {
+    /// Its name in the host log.
+    pub fn shown(&self) -> String {
+        match self {
+            AppMessage::Page { topic, .. } => format!("page {topic}"),
+            AppMessage::Settings { revision, .. } => format!("settings {revision}"),
+        }
+    }
+}
+
 /// Status detail of a feature whose list version is not its session version (decisions 2 and 5
 /// of the feature session sync plan): it starts at the next game start.
 pub const UPDATE_WAITS: &str = "the update starts at the next game start";
@@ -351,6 +377,22 @@ pub fn new_instance() -> u64 {
 /// Starts one feature from its entry (the loaded library, or a test feature). The HostApi
 /// carries the feature's own version; an API 1 feature reads only the first fields.
 fn start(meta: &ActiveFeature, activation: u64, game: &str, backend: &Arc<dyn Backend>, net: &Arc<Mutex<Net>>, subs: &Arc<Mutex<Subs>>, entry: Entry) -> Result<Running, String> {
+    // A feature with user files gets the data folder of the game's user folder (files.rs
+    // data_dir_for): another folder (-homedir) has its own, which the exit hook of that session
+    // gets too. A refused folder keeps the base one: no user file call works then.
+    let data_dir = match (&meta.data_dir, meta.capabilities.contains(&Capability::UserFiles)) {
+        (Some(base), true) => Some(backend.user_root(game).map_or_else(|_| base.clone(), |r| crate::files::data_dir_for(base, game, &r))),
+        (d, _) => d.clone(),
+    };
+    // The settings file is read at every start (also a restart after a link loss or an update),
+    // so the start runs the current values. A bad file is logged; the feature uses its defaults.
+    let (settings_revision, settings) = match (&meta.settings, entry.api >= 6) {
+        (Some(file), true) => crate::settings::SettingsFile::load(file).map(|f| f.start(&meta.version)).unwrap_or_else(|e| {
+            backend.log(&format!("feature {} settings not read: {e}", meta.id));
+            (0, "{}".into())
+        }),
+        _ => (0, "{}".into()),
+    };
     let ctx = Box::new(Ctx {
         id: meta.id.clone(),
         activation,
@@ -358,15 +400,17 @@ fn start(meta: &ActiveFeature, activation: u64, game: &str, backend: &Arc<dyn Ba
         commands: meta.game_commands.clone(),
         hosts: meta.network_hosts.clone(),
         game: game.to_string(),
-        data_dir: meta.data_dir.as_deref().and_then(|p| p.to_str()).unwrap_or("").to_string(),
+        data_dir: data_dir.as_deref().and_then(|p| p.to_str()).unwrap_or("").to_string(),
         backend: backend.clone(),
         net: net.clone(),
         subs: subs.clone(),
         stopping: AtomicBool::new(false),
-        memory_maps: meta.memory_maps.iter().map(|m| m.id.clone()).collect(),
+        memory_maps: meta.map_ids().map(String::from).collect(),
         held: Mutex::new((Vec::new(), None)),
         shaders: meta.library.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).filter(|p| !p.as_os_str().is_empty()).map(|v| v.join("shaders")),
         user_files: meta.user_files.clone(),
+        settings,
+        settings_revision,
     });
     let game_started_us = backend.game_started().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_micros() as u64);
     let host = Box::new(HostApi {
@@ -396,6 +440,9 @@ fn start(meta: &ActiveFeature, activation: u64, game: &str, backend: &Arc<dyn Ba
         file_info: file_info_cb,
         file_read: file_read_cb,
         file_write: file_write_cb,
+        settings: ctx.settings.as_ptr(),
+        settings_len: ctx.settings.len(),
+        settings_revision: ctx.settings_revision,
     });
     let start_fn = entry.start;
     let mut out = std::mem::MaybeUninit::<FeatureApi>::zeroed();
@@ -567,7 +614,7 @@ impl FeatureSet {
                     let pin = self.pins.entry(meta.id.clone()).or_insert_with(|| meta.version.clone()).clone();
                     if pin != meta.version {
                         if item.is_none_or(|i| i.meta.version != meta.version) {
-                            let status = FeatureStatus { id: meta.id.clone(), version: meta.version.clone(), state: State::Stopped, detail: Some(UPDATE_WAITS.into()), pass: None, activation: None };
+                            let status = FeatureStatus { id: meta.id.clone(), version: meta.version.clone(), state: State::Stopped, detail: Some(UPDATE_WAITS.into()), pass: None, activation: None, settings_revision: None };
                             self.backend.log(&format!("feature {} {}: waits, the session version is {pin} ({UPDATE_WAITS})", meta.id, meta.version));
                             self.replace(Item { meta, entry: None, run: None, status, activation: 0, waiting: false, cleaning: None });
                         }
@@ -611,7 +658,7 @@ impl FeatureSet {
 
     fn launch(&mut self, meta: ActiveFeature, activation: u64, start_fn: Result<Entry, Open>, kept: Option<Entry>) -> Item {
         let entry = start_fn.as_ref().ok().copied();
-        let mut status = FeatureStatus { id: meta.id.clone(), version: meta.version.clone(), state: State::Failed, detail: None, pass: None, activation: Some(activation) };
+        let mut status = FeatureStatus { id: meta.id.clone(), version: meta.version.clone(), state: State::Failed, detail: None, pass: None, activation: Some(activation), settings_revision: None };
         let mut waiting = false;
         // A cleanup that ran here and that the host completes later (Completion::Pending).
         let pending = self.backend.completion() == Completion::Pending;
@@ -641,6 +688,7 @@ impl FeatureSet {
             Ok(f) => match start(&meta, activation, &self.game, &self.backend, &self.net, &self.subs, f) {
                 Ok(r) => {
                     status.state = State::Running;
+                    status.settings_revision = (f.api >= 6).then_some(r._ctx.settings_revision);
                     Some(r)
                 }
                 // Start can call the host before it fails: release what it took (inputs,
@@ -740,10 +788,10 @@ impl FeatureSet {
     /// A game event with its attributes (native names) to every running feature. A version 4
     /// feature gets the attributes when it has vars_read; an older one gets the id only.
     pub fn game_event<N: AsRef<str>>(&mut self, id: &str, attrs: &[(N, Var)]) {
-        // The page and control prefixes belong to page() and control(): a game event with one
-        // would pose as the member's page or input.
-        if id.starts_with(abi::PAGE_EVENT) || id.starts_with(abi::CONTROL_EVENT) {
-            self.backend.log(&format!("game event {id} dropped: the prefixes {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT));
+        // The page, control and settings prefixes belong to page(), control() and settings(): a
+        // game event with one would pose as the member's page, input or settings.
+        if abi::app_event(id) {
+            self.backend.log(&format!("game event {id} dropped: the prefixes {}, {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT, abi::SETTINGS_PREFIX));
             return;
         }
         self.send(|_| true, id, attrs, false);
@@ -753,8 +801,8 @@ impl FeatureSet {
     /// a feature that starts during a session the current state that the others already have (the
     /// ATS configuration events).
     pub fn game_event_to<N: AsRef<str>>(&mut self, feature: &str, id: &str, attrs: &[(N, Var)]) {
-        if id.starts_with(abi::PAGE_EVENT) || id.starts_with(abi::CONTROL_EVENT) {
-            self.backend.log(&format!("game event {id} dropped: the prefixes {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT));
+        if abi::app_event(id) {
+            self.backend.log(&format!("game event {id} dropped: the prefixes {}, {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT, abi::SETTINGS_PREFIX));
             return;
         }
         self.send(|i| i.meta.id == feature, id, attrs, false);
@@ -772,6 +820,47 @@ impl FeatureSet {
         let id = format!("{}{topic}", abi::PAGE_EVENT);
         self.send(|i| i.meta.id == feature, &id, &[(abi::PAGE_DATA, Var::Text(json.into()))], true);
         Ok(())
+    }
+
+    /// New settings of `feature` from the app (abi::SETTINGS_EVENT, API 6): `values` is the full
+    /// projection of `version` at `revision`. It goes only to a version 6 feature that runs that
+    /// version, and only when the revision is newer than the one that the activation runs (a
+    /// resend after a reconnect is not a change). Ok: the Ack detail; the report then names the
+    /// revision (FeatureStatus::settings_revision), which is the app's applied state.
+    pub fn settings(&mut self, feature: &str, version: &str, revision: u64, values: &str) -> Result<String, String> {
+        let item = self.items.iter().find(|i| i.meta.id == feature && i.run.is_some()).ok_or_else(|| format!("{feature} does not run"))?;
+        let Some(current) = item.status.settings_revision.filter(|_| item.entry.is_some_and(|e| e.api >= 6)) else { return Err(format!("{feature} takes no settings (feature API 5 or older)")) };
+        if item.meta.version != version { return Err(format!("{feature} runs {}, not {version}", item.meta.version)); }
+        if !crate::settings::valid_values(values) { return Err("the settings are not a JSON object or are too large".into()); }
+        if revision <= current { return Ok(format!("settings {feature} {revision}: {current} runs already")); }
+        let attrs = [(abi::SETTINGS_DATA, Var::Text(values.into())), (abi::SETTINGS_REVISION, Var::U64(revision))];
+        self.send(|i| i.meta.id == feature, abi::SETTINGS_EVENT, &attrs, true);
+        // A feature that failed in the call stopped (send): its revision does not change.
+        match self.items.iter_mut().find(|i| i.meta.id == feature && i.run.is_some()) {
+            Some(i) => {
+                i.status.settings_revision = Some(revision);
+                Ok(format!("settings {feature} {revision} delivered"))
+            }
+            None => Err(format!("{feature} failed in its settings call")),
+        }
+    }
+
+    /// One message of the app for one feature (a page message or settings), as the hosts queue
+    /// them between their I/O thread and the feature thread. Ok: the Ack detail.
+    pub fn app_message(&mut self, feature: &str, message: &AppMessage) -> Result<String, String> {
+        match message {
+            AppMessage::Page { topic, data, target } => {
+                // A start that ended (a restart while the message waited) does not get it.
+                if let Some(t) = target {
+                    let now = self.items.iter().find(|i| i.meta.id == feature && i.run.is_some()).map(|i| i.activation);
+                    if t.instance != self.instance || now != Some(t.activation) {
+                        return Err(format!("this start of {feature} ended"));
+                    }
+                }
+                self.page(feature, topic, data).map(|_| format!("page {feature}/{topic} delivered"))
+            }
+            AppMessage::Settings { version, revision, values } => self.settings(feature, version, *revision, values),
+        }
     }
 
     /// A control event from the app's input reader, to that feature only (abi::CONTROL_EVENT).
@@ -942,7 +1031,17 @@ impl FeatureSet {
 
     /// The report for the app (wire message Features).
     pub fn report(&self) -> crate::active::HostReport {
-        crate::active::HostReport { multiplayer: self.multiplayer, error: None, features: self.statuses(), session_versions: self.pins.clone() }
+        crate::active::HostReport { multiplayer: self.multiplayer, error: None, features: self.statuses(), session_versions: self.pins.clone(), user_root: self.other_user_root() }
+    }
+
+    /// The game's user folder when it is not the default one (ATS -homedir), as UTF-8 text for
+    /// the session record. Reports come often, so a backend keeps its answer (the ATS plugin
+    /// finds the folder once per game process).
+    fn other_user_root(&self) -> Option<String> {
+        let root = self.backend.user_root(&self.game).ok()?;
+        // One compare with data_dir_for (review r2): an alias of the default folder is it.
+        let default = crate::files::default_user_root(&self.game).is_some_and(|d| crate::files::same_user_root(&d, &root));
+        (!default).then(|| root.to_str().map(String::from)).flatten()
     }
 
     /// The answer of the app to request `id` of `feature`, given to that feature now (feature
@@ -1637,6 +1736,8 @@ pub(crate) mod tests {
     impl Feature for Probe {
         fn start(host: Host) -> Self {
             host.log(&format!("start on {}", host.game()));
+            let s = host.settings();
+            if s.revision() > 0 { host.log(&format!("start settings {} {:?}", s.revision(), s.f64("strength"))); }
             Probe { host, on_stop: None, subs: vec![], on_ready: vec![] }
         }
         fn stop(&mut self) {
@@ -1733,6 +1834,13 @@ pub(crate) mod tests {
                 panic!("feature bug in http");
             }
         }
+        /// Logs each settings change; a "strength" of 13 panics.
+        fn settings(&mut self, s: &crate::Settings) {
+            self.host.log(&format!("settings {} {:?}", s.revision(), s.f64("strength")));
+            if s.f64("strength") == Some(13.0) {
+                panic!("feature bug in settings");
+            }
+        }
         /// Logs each page message; topic "boom" panics.
         fn page(&mut self, topic: &str, data: &str) {
             self.host.log(&format!("page {topic} {data}"));
@@ -1769,7 +1877,7 @@ pub(crate) mod tests {
     crate::feature!(Probe);
 
     fn meta(id: &str, caps: &[Capability], mp: Multiplayer) -> ActiveFeature {
-        ActiveFeature { id: id.into(), version: "1.0.0".into(), library: "x".into(), games: vec!["ats".into()], capabilities: caps.to_vec(), multiplayer: mp, game_commands: vec![], network_hosts: vec![], memory_maps: vec![], data_dir: None, user_files: vec![] }
+        ActiveFeature { id: id.into(), version: "1.0.0".into(), library: "x".into(), games: vec!["ats".into()], capabilities: caps.to_vec(), multiplayer: mp, game_commands: vec![], network_hosts: vec![], memory_maps: vec![], data_dir: None, user_files: vec![], requires: vec![], settings: None }
     }
 
     /// A user file needs the capability and its declaration, in this game only; a refusal and a
@@ -1808,6 +1916,56 @@ pub(crate) mod tests {
         s.event("uf:ats:game.log.txt");
         assert!(logged(&rec, "[weather] uf:ats:game.log.txt: Err(Failed) Err(Failed)"));
         assert!(logs(&rec).iter().any(|l| l.contains("the game uses -homedir")));
+    }
+
+    /// -homedir: another user folder gives a user files feature its own data folder and goes in
+    /// the report (the app keeps it for the exit hook). The default folder and a refused one keep
+    /// the base folder and report nothing, as before; a feature with no user files never moves.
+    #[test]
+    fn another_user_folder_moves_the_data_folder_and_goes_in_the_report() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().join("features/weather/data");
+        let home = t.path().join("ATSData/American Truck Simulator");
+        let run = |root: Option<std::path::PathBuf>| {
+            let rec = Arc::new(Rec::default());
+            *rec.root.lock().unwrap() = root;
+            let mut s = set(&rec);
+            for (id, caps) in [("weather", vec![Capability::UserFiles]), ("plain", vec![])] {
+                s.add(ActiveFeature { data_dir: Some(base.clone()), ..meta(id, &caps, Multiplayer::Allowed) }, Ok(entry()));
+            }
+            s.event("dir");
+            (logs(&rec), s.report().user_root)
+        };
+        let dir = |id: &str, p: &std::path::Path| format!("[{id}] dir: {:?}", Some(p));
+        let (logs, report) = run(Some(home.clone()));
+        let own = base.join(crate::files::USER_FOLDERS).join(crate::files::root_id("ats", &home));
+        assert!(logs.contains(&dir("weather", &own)), "{logs:?}");
+        assert!(logs.contains(&dir("plain", &base)), "no user files: the base folder");
+        assert_eq!(report.as_deref(), home.to_str());
+        // Review r2: an alias of the default folder (other separators, an end separator, a lower
+        // case drive letter) is the default folder too: no report, the base folder.
+        let default = crate::files::default_user_root("ats").unwrap();
+        let mut alias = default.to_string_lossy().replace('\\', "/") + "/";
+        alias.get_mut(0..1).unwrap().make_ascii_lowercase();
+        for root in [Some(default), Some(alias.into()), None] {
+            let (logs, report) = run(root);
+            assert!(logs.contains(&dir("weather", &base)) && report.is_none(), "{logs:?}");
+        }
+        // Review r2: Documents through a junction. The plugin gives the canonical folder (the
+        // target), the default text names the junction: still the default folder.
+        #[cfg(windows)]
+        {
+            let (real, link) = (t.path().join("real"), t.path().join("link"));
+            std::fs::create_dir_all(real.join("American Truck Simulator/profiles")).unwrap();
+            let made = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"]).arg(&link).arg(&real).output().unwrap();
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            crate::files::TEST_DOCUMENTS.with(|d| *d.borrow_mut() = Some(link));
+            let target = crate::files::canonical_root(&real.join("American Truck Simulator")).unwrap();
+            assert_ne!(Some(&target), crate::files::default_user_root("ats").as_ref(), "the raw texts differ");
+            let (logs, report) = run(Some(target));
+            crate::files::TEST_DOCUMENTS.with(|d| *d.borrow_mut() = None);
+            assert!(logs.contains(&dir("weather", &base)) && report.is_none(), "{logs:?} {report:?}");
+        }
     }
 
     fn entry() -> Entry {
@@ -1856,6 +2014,71 @@ pub(crate) mod tests {
         assert_eq!(s.page("paged", "boom", "{}"), Ok(()));
         assert_eq!(s.statuses()[0].state, State::Failed);
         assert!(s.page("paged", "look", "{}").is_err(), "a failed feature gets no more page messages");
+    }
+
+    // Surfaces plan, section 4: a message with a target goes only to that start of the feature
+    // (this host instance and that activation); a restart or another host refuses it.
+    #[test]
+    fn a_page_target_names_one_start() {
+        let rec = Arc::new(Rec::default());
+        let mut s = set(&rec);
+        s.add(meta("paged", &[Capability::UiApp], Multiplayer::Allowed), Ok(entry()));
+        let activation = s.statuses()[0].activation.unwrap();
+        let msg = |instance: u64, activation: u64| AppMessage::Page { topic: "look".into(), data: "{}".into(), target: Some(PageTarget { instance, activation }) };
+        assert!(s.app_message("paged", &msg(s.instance(), activation)).is_ok());
+        assert_eq!(s.app_message("paged", &msg(s.instance(), activation + 1)), Err("this start of paged ended".into()));
+        assert_eq!(s.app_message("paged", &msg(s.instance() ^ 1, activation)), Err("this start of paged ended".into()));
+        assert!(s.app_message("absent", &msg(s.instance(), activation)).is_err());
+        assert!(s.app_message("paged", &AppMessage::Page { topic: "look".into(), data: "{}".into(), target: None }).is_ok(), "a message with no target goes to any start");
+    }
+
+    // Feature surfaces plan, section 3: a version 6 feature starts with the projection of its
+    // version from the settings file (a missing file: revision 0), gets a newer revision once
+    // as Feature::settings, and reports the revision that it runs. A resend of the same revision,
+    // another version, bad values, an API 5 feature and a game event with the prefix get nothing.
+    #[test]
+    fn settings_reach_a_version_6_feature_at_start_and_on_change() {
+        let t = tempfile::tempdir().unwrap();
+        let file = crate::settings::path(t.path(), "rain");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, r#"{"revision":3,"values":{"strength":0.7},"versions":{"1.0.0":{"strength":0.7}}}"#).unwrap();
+        unsafe extern "C" fn frame(_: *mut c_void, _: *const AbiFrame) -> i32 { abi::OK }
+        unsafe extern "C" fn event(_: *mut c_void, _: *const u8, _: usize) -> i32 { abi::OK }
+        unsafe extern "C" fn http(_: *mut c_void, _: u64, _: i32, _: *const u8, _: usize) -> i32 { abi::OK }
+        unsafe extern "C" fn game_event(_: *mut c_void, _: *const AbiEvent) -> i32 { abi::OK }
+        unsafe extern "C" fn stop(_: *mut c_void) {}
+        unsafe extern "C" fn start_v5(host: *const HostApi, out: *mut FeatureApi) -> i32 {
+            if (*host).api_version != 5 { return abi::BAD_ARGS; }
+            *out = FeatureApi { api_version: 5, instance: std::ptr::dangling_mut::<c_void>(), on_frame: Some(frame), on_event: Some(event), stop: Some(stop), on_http: Some(http), on_game_event: Some(game_event) };
+            abi::OK
+        }
+        let rec = Arc::new(Rec::default());
+        let mut s = set(&rec);
+        s.add(ActiveFeature { settings: Some(file.clone()), ..meta("rain", &[], Multiplayer::Allowed) }, Ok(entry()));
+        s.add(ActiveFeature { settings: Some(t.path().join("none/settings.json")), ..meta("fresh", &[], Multiplayer::Allowed) }, Ok(entry()));
+        s.add(ActiveFeature { settings: Some(file.clone()), ..meta("old", &[], Multiplayer::Allowed) }, Ok(Entry { start: start_v5, api: 5 }));
+        let revisions: Vec<_> = s.statuses().into_iter().map(|f| (f.id, f.settings_revision)).collect();
+        assert_eq!(revisions, [("rain".into(), Some(3)), ("fresh".into(), Some(0)), ("old".into(), None)]);
+        assert!(logged(&rec, "[rain] start settings 3 Some(0.7)"));
+        assert_eq!(s.settings("rain", "1.0.0", 4, r#"{"strength":0.9}"#), Ok("settings rain 4 delivered".into()));
+        assert!(logged(&rec, "[rain] settings 4 Some(0.9)"));
+        assert_eq!(s.statuses()[0].settings_revision, Some(4));
+        assert!(s.settings("rain", "1.0.0", 4, r#"{"strength":0.1}"#).unwrap().contains("4 runs already"), "a resend is not a change");
+        assert!(s.settings("rain", "1.0.0", 2, r#"{"strength":0.1}"#).unwrap().contains("runs already"));
+        assert!(!logged(&rec, "[rain] settings 4 Some(0.1)") && !logged(&rec, "[rain] settings 2 Some(0.1)"));
+        assert!(s.settings("rain", "0.9.0", 5, "{}").unwrap_err().contains("runs 1.0.0"));
+        for bad in ["[]", "1", "not json"] { assert!(s.settings("rain", "1.0.0", 5, bad).is_err(), "{bad}"); }
+        assert!(s.settings("old", "1.0.0", 5, "{}").unwrap_err().contains("API 5"));
+        assert!(s.settings("absent", "1.0.0", 5, "{}").unwrap_err().contains("does not run"));
+        assert_eq!(s.app_message("fresh", &AppMessage::Settings { version: "1.0.0".into(), revision: 1, values: r#"{"strength":0.2}"#.into() }), Ok("settings fresh 1 delivered".into()));
+        s.event("settings:changed");
+        assert_eq!(rec.logs.lock().unwrap().iter().filter(|l| l.contains("] settings ")).count(), 2, "a game event cannot pose as the settings");
+        // A restart reads the file again: a new activation runs its current revision.
+        std::fs::write(&file, r#"{"revision":6,"versions":{"1.0.0":{"strength":0.4}}}"#).unwrap();
+        s.add(ActiveFeature { id: "rain2".into(), settings: Some(file.clone()), ..meta("rain2", &[], Multiplayer::Allowed) }, Ok(entry()));
+        assert!(logged(&rec, "[rain2] start settings 6 Some(0.4)"));
+        assert!(s.settings("rain", "1.0.0", 7, r#"{"strength":13}"#).unwrap_err().contains("failed"));
+        assert_eq!(s.statuses()[0].state, State::Failed);
     }
 
     // A control event reaches its own feature only, with the controls capability, as

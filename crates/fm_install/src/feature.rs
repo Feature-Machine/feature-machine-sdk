@@ -60,7 +60,25 @@ pub struct Manifest {
     /// user_files, fm_feature_sdk::files); consent lists each one, and the hosts refuse others.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_files: Vec<UserFile>,
+    /// Maps that a module provides (module layer plan 8.1): by interface and map id, never by
+    /// module. The lock selects the provider; the host reads a required map only from it, also
+    /// when the package carries an embedded copy for older apps (they ignore this field).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Requirement>,
+    /// The oldest app version that this build runs on (release-admin item 6, crate::release).
+    /// In the signed package, so the feed cannot lower it. Apps before 0.2 ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_app: Option<String>,
+    /// API 6: page, icon, banner, widgets and settings (crate::surfaces). Flattened, so the
+    /// fields sit at the top of feature.json and an API 1 to 5 manifest has none of them.
+    #[serde(flatten)]
+    pub surfaces: crate::surfaces::Surfaces,
 }
+
+pub use fm_feature_sdk::active::Requirement;
+
+/// The most module requirements of one feature.
+pub const MAX_REQUIRES: usize = 8;
 
 /// Feature ids are folder names, ATS mod names and URL parts: lower case, digits and "-".
 pub fn check_id(id: &str) -> io::Result<()> {
@@ -80,6 +98,7 @@ impl Manifest {
     pub fn check(&self) -> io::Result<()> {
         check_id(&self.id)?;
         crate::check_version(&self.version)?;
+        crate::release::check_min_app(&self.id, self.min_app.as_deref()).map_err(bad)?;
         if !(MIN_FEATURE_API..=FEATURE_API).contains(&self.api) {
             return Err(bad(format!("{} needs feature API {}, this app gives {MIN_FEATURE_API} to {FEATURE_API}", self.id, self.api)));
         }
@@ -111,7 +130,34 @@ impl Manifest {
             return Err(bad("render_shader needs render_pass".into()));
         }
         self.check_network()?;
-        self.check_user_files()
+        self.check_user_files()?;
+        self.check_requires()?;
+        crate::surfaces::check(self)
+    }
+
+    /// Module requirements (plan 8.1), API 5 and 1 to MAX_REQUIRES entries with a valid range and
+    /// map id, one per map id. Two kinds: a camera-only depth feature requires camera contracts
+    /// (the 6c trust path; an embedded copy's named contract must agree), and a memory writer
+    /// (vars_read, vars_memory, vars_write, no embedded map) requires setter maps only (ground
+    /// wetness plan; memory::module_writer, which the app takes only from the feed).
+    fn check_requires(&self) -> io::Result<()> {
+        if self.requires.is_empty() { return Ok(()); }
+        let caps = &self.capabilities;
+        let camera = caps.contains(&Capability::RenderDepth) && !caps.contains(&Capability::VarsMemory) && !caps.contains(&Capability::VarsWrite);
+        let writer = [Capability::VarsRead, Capability::VarsMemory, Capability::VarsWrite].iter().all(|c| caps.contains(c)) && self.memory_maps.is_empty();
+        if self.api < 5 || !(camera || writer) || self.requires.len() > MAX_REQUIRES {
+            return Err(bad(format!("{}: requires needs API 5, 1 to {MAX_REQUIRES} entries, and render_depth with no vars_memory or vars_write (camera maps) or vars_read, vars_memory and vars_write with no embedded map (setter maps)", self.id)));
+        }
+        let allowed: &[&str] = if camera { &[crate::memory::CAMERA_CONTRACT, crate::memory::LOCATOR_CONTRACT] } else { &[crate::memory::SETTER_V2_CONTRACT] };
+        let mut seen = std::collections::BTreeSet::new();
+        for r in &self.requires {
+            let range = semver::VersionReq::parse(&r.versions).is_ok();
+            let contract = self.map_contracts.get(&r.map).is_none_or(|c| *c == r.interface);
+            if !allowed.contains(&r.interface.as_str()) || !range || !fm_memory::valid_id(&r.map) || !seen.insert(&r.map) || !contract {
+                return Err(bad(format!("{}: bad requirement {:?} (a contract of its kind, a semver range, a map id once, its map_contracts entry)", self.id, r.map)));
+            }
+        }
+        Ok(())
     }
 
     /// User files: API 5 and the user_files capability with 1 to 16 valid entries, or none of
@@ -142,8 +188,10 @@ impl Manifest {
         // A render_depth feature may pin camera maps without vars_memory (owner decision, plan 7.5): the
         // host reads them for the shader host block only. Verification refuses other contracts.
         let camera = !memory && !write && self.capabilities.contains(&Capability::RenderDepth);
-        if self.api < 5 || !(camera || memory && self.capabilities.contains(&Capability::VarsRead)) || self.memory_maps.is_empty() || self.memory_maps.len() > 32 {
-            return Err(bad("memory needs API 5, vars_read, vars_memory (or render_depth for camera maps) and 1 to 32 pinned maps".into()));
+        // A memory writer whose maps all come from modules pins none (check_requires checks it).
+        let from_modules = memory && self.memory_maps.is_empty() && !self.requires.is_empty();
+        if self.api < 5 || !(camera || memory && self.capabilities.contains(&Capability::VarsRead)) || (self.memory_maps.is_empty() && !from_modules) || self.memory_maps.len() > 32 {
+            return Err(bad("memory needs API 5, vars_read, vars_memory (or render_depth for camera maps) and 1 to 32 pinned maps (none when all maps come from modules)".into()));
         }
         let mut seen = std::collections::BTreeSet::new();
         for m in &self.memory_maps {
@@ -217,6 +265,11 @@ impl Manifest {
         Ok(())
     }
 
+    /// The page entry in ui/: `page.entry` (API 6), else the older `ui` field.
+    pub fn page_entry(&self) -> Option<&str> {
+        self.surfaces.page.as_ref().map(|p| p.entry.as_str()).or(self.ui.as_deref())
+    }
+
     pub fn runs_on(&self, game: Game) -> bool {
         self.games.contains(&game)
     }
@@ -258,6 +311,16 @@ pub fn inspect<R: Read + Seek>(zip: R) -> io::Result<(Manifest, Vec<String>)> {
     if !entries.iter().any(|(p, dir)| !dir && *p == safe_rel(&parts::library()).unwrap_or_default()) {
         return Err(bad(format!("{} has no library for this system ({})", m.id, parts::library())));
     }
+    // Sizes from the zip headers; a file is read only when its size is within its limit.
+    let files: Vec<(String, u64)> = entries.iter().filter(|(_, dir)| !dir).filter_map(|(p, _)| {
+        let name = p.components().filter_map(|c| c.as_os_str().to_str()).collect::<Vec<_>>().join("/");
+        Some((name.clone(), a.by_name(&name).ok()?.size()))
+    }).collect();
+    crate::surfaces::check_files(&m, &files, &mut |name| {
+        let mut out = vec![];
+        a.by_name(name).map_err(io::Error::other)?.take(crate::surfaces::limits::BANNER + 1).read_to_end(&mut out)?;
+        Ok(out)
+    })?;
     for (p, dir) in entries.iter().filter(|(p, _)| p.starts_with(parts::SHADERS)) {
         let name = p.strip_prefix(parts::SHADERS).ok().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         if *dir && name.is_empty() { continue; }
@@ -302,8 +365,9 @@ pub mod parts {
     /// Compiled pixel shaders (<name>.cso, capability render_shader). In a feature's source, the
     /// same folder holds the HLSL that fm_pack compiles (pack_shaders).
     pub const SHADERS: &str = "shaders";
-    /// The folders that a package can have at its top, besides feature.json.
-    pub const DIRS: [&str; 6] = ["bin", UI, ATS_MOD, MSFS_COMMUNITY, "maps", SHADERS];
+    /// The folders that a package can have at its top, besides feature.json. art and widgets:
+    /// API 6 (crate::surfaces).
+    pub const DIRS: [&str; 8] = ["bin", UI, ATS_MOD, MSFS_COMMUNITY, "maps", SHADERS, crate::surfaces::ART, crate::surfaces::WIDGETS];
 }
 
 /// Builds a feature package (fm_pack feature): feature.json and the ui/, ats-mod/ and
@@ -332,6 +396,7 @@ pub fn pack_shaders(src: &Path, libraries: &[PathBuf], shaders: &[(String, Vec<u
         return Err(bad(format!("{}: shaders/ must be compiled first (fm_pack feature compiles it)", m.id)));
     }
     for (name, bytes) in shaders { check_shader(&m, &format!("{name}.cso"), bytes.len() as u64)?; }
+    check_surface_files(src, &m)?;
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).unix_permissions(0o644);
     let mut z = zip::ZipWriter::new(out);
     let mut add = |name: &str, path: &Path| -> io::Result<()> {
@@ -352,7 +417,7 @@ pub fn pack_shaders(src: &Path, libraries: &[PathBuf], shaders: &[(String, Vec<u
         };
         add(name, lib)?;
     }
-    for part in [parts::UI, parts::ATS_MOD, parts::MSFS_COMMUNITY, "maps"] {
+    for part in [parts::UI, parts::ATS_MOD, parts::MSFS_COMMUNITY, "maps", crate::surfaces::ART, crate::surfaces::WIDGETS] {
         let dir = src.join(part);
         if !dir.is_dir() {
             continue;
@@ -370,6 +435,20 @@ pub fn pack_shaders(src: &Path, libraries: &[PathBuf], shaders: &[(String, Vec<u
     }
     z.finish().map_err(io::Error::other)?;
     Ok(m)
+}
+
+/// The same file rules as inspect (crate::surfaces::check_files) on the ui/, art/ and widgets/
+/// folders of a feature source: pack runs it, and a test runs it on each first-party feature.
+pub fn check_surface_files(src: &Path, m: &Manifest) -> io::Result<()> {
+    let mut files = vec![];
+    for part in [parts::UI, crate::surfaces::ART, crate::surfaces::WIDGETS] {
+        let dir = src.join(part);
+        if !dir.is_dir() { continue; }
+        let mut rels = vec![];
+        crate::package::walk(&dir, &dir, &mut rels)?;
+        for rel in rels { files.push((format!("{part}/{rel}"), std::fs::metadata(dir.join(&rel))?.len())); }
+    }
+    crate::surfaces::check_files(m, &files, &mut |name| std::fs::read(src.join(safe_rel(name)?)))
 }
 
 /// One feature in the catalog of the feed (features/catalog.json).
@@ -393,6 +472,38 @@ pub struct CatalogEntry {
     /// with the feed key (publishing pipeline plan, L1). The app refuses an entry without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// The channel of this version on the feed (release-admin item 6). Not in the package: a
+    /// promotion moves the same bytes from Preview to Stable. Missing: stable (legacy feed).
+    #[serde(default, skip_serializing_if = "crate::release::Channel::is_stable")]
+    pub channel: crate::release::Channel,
+    /// The icon and banner of the package (API 6), copied next to it on the feed, so Discover
+    /// shows them before an install. Not in the package: the catalog step writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub art: Option<CatalogArt>,
+}
+
+/// Feed copies of a package's art (crate::surfaces): URLs relative to the catalog, as `url`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CatalogArt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<ArtFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<ArtFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArtFile {
+    pub url: String,
+    /// SHA-256 of the file: the app shows it only when the download has this digest.
+    pub sha256: String,
+}
+
+impl CatalogArt {
+    /// The same art with each URL changed by `f` (the feed views put files at other paths).
+    pub fn map_urls(&self, f: impl Fn(&str) -> String) -> CatalogArt {
+        let map = |a: &Option<ArtFile>| a.as_ref().map(|a| ArtFile { url: f(&a.url), sha256: a.sha256.clone() });
+        CatalogArt { icon: map(&self.icon), banner: map(&self.banner) }
+    }
 }
 
 /// The public key of the feature feed. Its own key, not the app updater key: the publishing
@@ -476,7 +587,7 @@ fn version_key(v: &str) -> Option<semver::Version> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn manifest() -> Manifest {
@@ -492,7 +603,7 @@ mod tests {
             multiplayer_note: None,
             ui: Some("index.html".into()),
             game_commands: vec![],
-            network_hosts: vec![], memory_maps: vec![], map_contracts: Default::default(), controls: vec![], user_files: vec![],
+            network_hosts: vec![], memory_maps: vec![], map_contracts: Default::default(), controls: vec![], user_files: vec![], requires: vec![], min_app: None, surfaces: Default::default(),
         }
     }
 
@@ -618,6 +729,17 @@ mod tests {
         c.features[1].manifest.check().unwrap();
     }
 
+    /// The direct powers (submission review plan R2) are known names that pass the check. An
+    /// app before them reads each one as Unknown, so it refuses the feature (the test above).
+    #[test]
+    fn direct_powers_are_known_capabilities() {
+        let names = ["direct_files", "direct_processes", "direct_registry", "direct_network", "load_code"];
+        let caps: Vec<Capability> = serde_json::from_value(serde_json::json!(names)).unwrap();
+        assert_eq!(caps, [Capability::DirectFiles, Capability::DirectProcesses, Capability::DirectRegistry, Capability::DirectNetwork, Capability::LoadCode]);
+        let m = manifest();
+        Manifest { capabilities: [m.capabilities.clone(), caps].concat(), ..m }.check().unwrap();
+    }
+
     #[test]
     fn read_manifest_checks_the_package() {
         let json = serde_json::to_vec(&manifest()).unwrap();
@@ -675,7 +797,31 @@ mod tests {
     }
 
     fn entry(version: &str, sha: &str) -> CatalogEntry {
-        CatalogEntry { manifest: Manifest { version: version.into(), ..manifest() }, url: format!("files/speed-alert-{version}.zip"), sha256: sha.into(), size: 1, parts: vec![], history: None, signature: None }
+        CatalogEntry { manifest: Manifest { version: version.into(), ..manifest() }, url: format!("files/speed-alert-{version}.zip"), sha256: sha.into(), size: 1, parts: vec![], art: None, history: None, signature: None, channel: Default::default() }
+    }
+
+    // Release-admin item 6 on the real feed types: a stable entry and a manifest without min_app
+    // write no new field (legacy bytes), the channel survives both flatten levels (catalog entry
+    // and history entry), an unknown channel reads as Unknown, and a bad min_app fails check().
+    #[test]
+    fn release_fields_on_the_feature_feed_types() {
+        let stable = entry("1.0.0", "a");
+        let json = serde_json::to_string(&stable).unwrap();
+        assert!(!json.contains("channel") && !json.contains("min_app"), "{json}");
+        assert_eq!(serde_json::from_str::<CatalogEntry>(&json).unwrap(), stable);
+        let preview = CatalogEntry { channel: crate::release::Channel::Preview, manifest: Manifest { min_app: Some("0.2.0-preview.1".into()), ..stable.manifest.clone() }, ..stable.clone() };
+        let json = serde_json::to_string(&preview).unwrap();
+        assert!(json.contains(r#""channel":"preview""#) && json.contains(r#""min_app":"0.2.0-preview.1""#), "{json}");
+        assert_eq!(serde_json::from_str::<CatalogEntry>(&json).unwrap(), preview);
+        let history = HistoryEntry { entry: preview.clone(), published: 5, withdrawn: false };
+        let json = serde_json::to_string(&history).unwrap();
+        assert_eq!(serde_json::from_str::<HistoryEntry>(&json).unwrap(), history);
+        let nightly = json.replace(r#""channel":"preview""#, r#""channel":"nightly""#);
+        assert_eq!(serde_json::from_str::<HistoryEntry>(&nightly).unwrap().entry.channel, crate::release::Channel::Unknown);
+        let nightly = serde_json::to_string(&preview).unwrap().replace("preview\"", "nightly\"");
+        assert_eq!(serde_json::from_str::<CatalogEntry>(&nightly).unwrap().channel, crate::release::Channel::Unknown);
+        preview.manifest.check().unwrap();
+        assert!(Manifest { min_app: Some("0.2".into()), ..manifest() }.check().is_err());
     }
 
     fn versions(h: &History) -> Vec<&str> {

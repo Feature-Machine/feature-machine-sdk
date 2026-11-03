@@ -13,6 +13,11 @@ use std::path::Path;
 pub const SESSION: &str = "memory-session.json";
 pub const SIGNATURE: &str = "memory-session.json.sig";
 pub const HOST_VERSION: &str = "0.1.0";
+/// The host APIs that a signed session can name: from the first API with sessions (5) to this
+/// SDK. A host loads each feature at the API that it was built for (abi.rs change rule), so a
+/// session signed for an older host API stays valid; its signature and file digests still bind
+/// every byte. A session for a newer host API than this one is refused.
+pub const SESSION_HOST_APIS: std::ops::RangeInclusive<u32> = 5..=fm_feature_sdk::API_VERSION;
 const LIMIT: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,7 +65,11 @@ pub fn map_path(m: &MapDependency) -> String { format!("maps/{}/{}/map.json", m.
 
 /// One configured public key serves app packages, reviewed maps and session records. Private
 /// signing material stays in the approved store and never enters the app or native host.
-pub fn public_key() -> String { crate::package::app_key().into() }
+pub fn public_key() -> String {
+    #[cfg(test)]
+    if let Some(k) = tests::TEST_KEY.with(|k| k.borrow().clone()) { return k; }
+    crate::package::app_key().into()
+}
 
 fn text(bytes: Vec<u8>) -> Result<String, String> { String::from_utf8(bytes).map_err(|e| e.to_string()) }
 
@@ -84,6 +93,53 @@ fn pinned(bytes: &[u8], expected: &MapDependency) -> Result<Signed, String> {
 /// signature on a read-only map adds no safety and only stops a creator (owner decision, plan 6c).
 pub fn camera_only(m: &Manifest) -> bool {
     !m.capabilities.contains(&fm_feature_sdk::Capability::VarsMemory) && !m.capabilities.contains(&fm_feature_sdk::Capability::VarsWrite)
+}
+
+/// A memory feature whose maps all come from modules (ground wetness plan, G1): no embedded map,
+/// so no session record of ours. The feed signature of the package and the signed module catalog
+/// bind it instead, so the app takes such a feature only from the feed, never from a file.
+pub fn module_writer(m: &Manifest) -> bool {
+    !camera_only(m) && m.memory_maps.is_empty() && !m.requires.is_empty()
+}
+
+/// The package of a module writer as the feed gave it, kept in its version folder at the
+/// install (Sol r1 B1): the exact bytes and their feed signature. The host checks the installed
+/// files against them at each game start (verify_feed_package).
+pub const FEED_PACKAGE: &str = "feed-package.zip";
+pub const FEED_SIGNATURE: &str = "feed-package.zip.sig";
+
+/// Keeps the feed package of a module writer (`zip`, its feed `signature`) in `dir`. The app
+/// calls it after the unpack of a catalog download; a file install has no signature to keep.
+pub fn keep_feed_package(dir: &Path, zip: &[u8], signature: &str) -> Result<(), String> {
+    for (name, bytes) in [(FEED_PACKAGE, zip), (FEED_SIGNATURE, signature.as_bytes())] {
+        fm_platform::files::write_replace(&dir.join(name), bytes).map_err(|e| format!("{}: {e}", dir.join(name).display()))?;
+    }
+    Ok(())
+}
+
+/// The host check of a module writer (Sol r1 B1), as the session record is for embedded maps:
+/// the kept package has the digest of the lock (`stamp`) and the feed signature (`key`) for
+/// this version, and each of its files equals the installed file. So a changed library or
+/// manifest, or a package that did not come from the feed, refuses the feature.
+pub fn verify_feed_package(dir: &Path, m: &Manifest, stamp: &str, key: &str) -> Result<(), String> {
+    let read = |rel: &Path| -> Result<Vec<u8>, String> {
+        let path = dir.join(rel);
+        if std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?.len() > LIMIT as u64 { return Err(format!("{}: exceeds the size limit", path.display())); }
+        std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let refuse = |why: String| format!("{} {}: {why}; install it again from the Feature Machine catalog", m.id, m.version);
+    let bytes = read(Path::new(FEED_PACKAGE)).map_err(refuse)?;
+    let signature = String::from_utf8(read(Path::new(FEED_SIGNATURE)).map_err(refuse)?).map_err(|e| refuse(e.to_string()))?;
+    if digest(&bytes) != stamp { return Err(refuse("the kept feed package is not the installed package".into())); }
+    crate::package::verify(&bytes, signature.trim(), key, &m.version).map_err(refuse)?;
+    let mut a = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).map_err(|e| refuse(e.to_string()))?;
+    for (i, (rel, is_dir)) in crate::checked_entries(&mut a, crate::Kind::Feature).map_err(|e| refuse(e.to_string()))?.into_iter().enumerate() {
+        if is_dir { continue; }
+        let mut want = Vec::new();
+        a.by_index(i).map_err(|e| refuse(e.to_string()))?.read_to_end(&mut want).map_err(|e| refuse(e.to_string()))?;
+        if read(&rel).map_err(refuse)? != want { return Err(refuse(format!("{} differs from the signed package", rel.display()))); }
+    }
+    Ok(())
 }
 
 /// Rules of each map that a feature may use: a camera map without vars_memory, the contract that
@@ -115,11 +171,18 @@ fn verify_pinned(m: &Manifest, mut read: impl FnMut(&str) -> Result<Vec<u8>, Str
 /// map or locator. The creator tools (`fm_pack map`) use it on unsigned files, so a file that
 /// passes there fails in the host only on its signature or dependency.
 pub fn parse_package(bytes: &[u8]) -> Result<Signed, String> {
+    parse_package_contract(bytes).map(|(map, _)| map)
+}
+
+/// parse_package with the contract that the package names (checked against its body), for the
+/// module rule that a provided interface is that contract.
+pub fn parse_package_contract(bytes: &[u8]) -> Result<(Signed, String), String> {
     let p: MapPackage = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if p.kind != "memory-map" || !contract_matches(&p) { return Err("map package identity or contract differs".into()); }
+    let contract = p.contract;
     match (p.map, p.locator) {
-        (Some(m), None) => { m.check().map_err(|e| e.to_string())?; Ok(Signed::Map(m)) }
-        (None, Some(l)) => { l.check().map_err(|e| e.to_string())?; Ok(Signed::Locator(l)) }
+        (Some(m), None) => { m.check().map_err(|e| e.to_string())?; Ok((Signed::Map(m), contract)) }
+        (None, Some(l)) => { l.check().map_err(|e| e.to_string())?; Ok((Signed::Locator(l), contract)) }
         _ => Err("a map package holds one map or one locator".into()),
     }
 }
@@ -163,7 +226,7 @@ fn verify_with(key: &str, m: &Manifest, mut read: impl FnMut(&str) -> Result<Vec
     let bytes = read(SESSION)?;
     crate::package::verify(&bytes, &text(read(SIGNATURE)?)?, key, &m.version)?;
     let s: Session = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if s.kind != "feature-memory-session" || s.host_version != HOST_VERSION || s.host_api != fm_feature_sdk::API_VERSION || s.manifest != *m || s.files.len() > 4096 {
+    if s.kind != "feature-memory-session" || s.host_version != HOST_VERSION || !SESSION_HOST_APIS.contains(&s.host_api) || s.manifest != *m || s.files.len() > 4096 {
         return Err("signed session differs from feature metadata or this host".into());
     }
     if !s.files.contains_key(crate::FEATURE_MANIFEST) || !s.files.contains_key(&crate::feature::parts::library()) {
@@ -203,6 +266,12 @@ pub fn verify_archive<R: Read + Seek>(a: &mut zip::ZipArchive<R>, m: &Manifest) 
         Ok(b)
     };
     if camera_only(m) { return verify_pinned(m, |path| read(a, path)); }
+    if module_writer(m) {
+        m.check().map_err(|e| e.to_string())?;
+        // One trust path per package: a session record here would be unchecked.
+        if a.by_name(SESSION).is_ok() || a.by_name(SIGNATURE).is_ok() { return Err("a feature with module maps carries no session record".into()); }
+        return Ok(vec![]);
+    }
     let maps = verify_with(&public_key(), m, |path| read(a, path))?;
     let mut bytes = Vec::new();
     a.by_name(SESSION).map_err(|e| e.to_string())?.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
@@ -242,6 +311,7 @@ pub fn verify_directory(root: &Path, m: &Manifest) -> Result<Vec<Signed>, String
         std::fs::read(path).map_err(|e| e.to_string())
     };
     if camera_only(m) { return verify_pinned(m, read); }
+    if module_writer(m) { m.check().map_err(|e| e.to_string())?; return Ok(vec![]); }
     let maps = verify_with(&public_key(), m, read)?;
     let session: Session = serde_json::from_slice(&std::fs::read(root.join(SESSION)).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let expected: BTreeSet<_> = session.files.keys().map(String::as_str).chain([SESSION, SIGNATURE, crate::COMPLETE, crate::PACKAGE_STAMP]).collect();
@@ -280,6 +350,7 @@ pub(crate) fn verify_source(root: &Path, libraries: &[std::path::PathBuf], shade
     if camera_only(m) {
         return verify_pinned(m, |name| std::fs::read(root.join(crate::feature::safe_rel(name).map_err(|e| e.to_string())?)).map_err(|e| format!("{name}: {e}"))).map(|_| ());
     }
+    if module_writer(m) { return m.check().map_err(|e| e.to_string()); }
     let signed: Session = serde_json::from_slice(&std::fs::read(root.join(SESSION)).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     if signed.files != seal(root, libraries, shaders)?.files { return Err("source files differ from the signed session".into()); }
     verify_with(&public_key(), m, |name| {
@@ -339,6 +410,27 @@ mod tests {
         ].into_iter().map(|(name, bytes)| (name.into(), bytes.to_vec())).collect()
     }
     fn manifest(files: &BTreeMap<String, Vec<u8>>) -> Manifest { serde_json::from_slice(&files["feature.json"]).unwrap() }
+    thread_local! {
+        /// public_key() on this test thread, when set (fresh_session).
+        pub(super) static TEST_KEY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+    /// The fixture with its map and a session for `host_api` signed now with a throwaway key,
+    /// which public_key() gives on this thread (the committed session is for host API 5).
+    fn fresh_session(host_api: u32) -> BTreeMap<String, Vec<u8>> {
+        let key = crate::test_signing::TestKey::default();
+        TEST_KEY.with(|k| *k.borrow_mut() = Some(key.public()));
+        let mut f = files();
+        let m = manifest(&f);
+        let map = map_path(&m.memory_maps[0]);
+        let sig = key.sign(&f[&map], &m.memory_maps[0].version);
+        f.insert(format!("{map}.sig"), sig.into_bytes());
+        let signed = f.iter().filter(|(n, _)| ![SESSION, SIGNATURE].contains(&n.as_str())).map(|(n, b)| (n.clone(), digest(b))).collect();
+        let session = Session { kind: "feature-memory-session".into(), host_version: HOST_VERSION.into(), host_api, manifest: m.clone(), files: signed };
+        let bytes = serde_json::to_vec_pretty(&session).unwrap();
+        f.insert(SIGNATURE.into(), key.sign(&bytes, &m.version).into_bytes());
+        f.insert(SESSION.into(), bytes);
+        f
+    }
     fn verify(files: &BTreeMap<String, Vec<u8>>, m: &Manifest) -> Result<Vec<Signed>, String> {
         verify_with(&public_key(), m, |name| files.get(name).cloned().ok_or_else(|| format!("missing {name}")))
     }
@@ -364,6 +456,18 @@ mod tests {
         assert_eq!(s.files.get("shaders/mirage.cso"), Some(&digest(&shader.1)));
         assert!(seal(dir.path(), std::slice::from_ref(&lib), &[shader.clone(), shader]).is_err());
         assert!(!seal(dir.path(), &[lib], &[]).unwrap().files.keys().any(|k| k.starts_with("shaders/")));
+    }
+    // Review r1 of the surfaces slice 2: the committed session (release key, host API 5) passes
+    // on this host (complete_signed_session_passes_and_each_changed_file_is_refused); a session
+    // for this SDK's API passes too, and one for an API before sessions or after this SDK fails.
+    #[test]
+    fn a_session_names_a_host_api_that_this_host_runs() {
+        assert!(SESSION_HOST_APIS.contains(&5) && SESSION_HOST_APIS.contains(&fm_feature_sdk::API_VERSION));
+        for (api, ok) in [(fm_feature_sdk::API_VERSION, true), (4, false), (fm_feature_sdk::API_VERSION + 1, false)] {
+            let f = fresh_session(api);
+            assert_eq!(verify(&f, &manifest(&f)).is_ok(), ok, "host API {api}");
+        }
+        TEST_KEY.with(|k| *k.borrow_mut() = None);
     }
     #[test]
     fn complete_signed_session_passes_and_each_changed_file_is_refused() {

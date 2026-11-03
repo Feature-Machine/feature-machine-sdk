@@ -10,7 +10,8 @@ use std::ffi::c_void;
 /// 5: memory leases and the color pass. 5 is not released, so the render calls, page events,
 /// shaders, control events and the user files service (game_started_us, file_info, file_read,
 /// file_write, LifecycleCall::game_running) extend it at the end instead of starting 6.
-pub const API_VERSION: u32 = 5;
+/// 6: feature surfaces (page, art, widgets and settings in feature.json) and the settings path.
+pub const API_VERSION: u32 = 6;
 /// The oldest feature API that a host of this SDK still loads.
 pub const MIN_API_VERSION: u32 = 1;
 
@@ -102,6 +103,21 @@ pub const CONTROL_STATE: &str = "state";
 pub const CONTROL_VALUE: &str = "value";
 pub const CONTROL_DELTA: &str = "delta";
 
+/// Version 6. The id of the event that gives a feature its new settings (feature surfaces plan,
+/// section 3): the text attribute SETTINGS_DATA holds the full projection (a JSON object) and
+/// the U64 attribute SETTINGS_REVISION its revision. A host gives it only to a version 6 table.
+/// A host never gives a game event an id that starts with SETTINGS_PREFIX.
+pub const SETTINGS_PREFIX: &str = "settings:";
+pub const SETTINGS_EVENT: &str = "settings:changed";
+pub const SETTINGS_DATA: &str = "data";
+pub const SETTINGS_REVISION: &str = "revision";
+
+/// An event id that only the app gives (a page message, a control, settings): a game event with
+/// one of these prefixes would pose as the member.
+pub fn app_event(id: &str) -> bool {
+    id.starts_with(PAGE_EVENT) || id.starts_with(CONTROL_EVENT) || id.starts_with(SETTINGS_PREFIX)
+}
+
 pub const INPUT_PRESS: u32 = 0;
 pub const INPUT_AXIS: u32 = 1;
 
@@ -142,6 +158,8 @@ pub struct HostApi {
     pub http_get: unsafe extern "C" fn(ctx: *mut c_void, url: *const u8, len: usize) -> i64,
     /// Version 3. The feature's own data folder (UTF-8 path; length 0 when the host has none).
     /// The same folder as LifecycleCall::data_dir; it stays over updates and goes at uninstall.
+    /// A feature with user_files in a game with another user folder (ATS -homedir) gets a folder
+    /// of its own for that user folder (files::data_dir_for), the same in the exit hook.
     pub data_dir: *const u8,
     pub data_dir_len: usize,
     /// Version 4. Read a native game value by the game's own name (capability vars_read), as
@@ -186,6 +204,11 @@ pub struct HostApi {
     pub file_read: FileReadFn,
     /// Version 5. Replaces a declared file with access write, atomically. The folder must exist.
     pub file_write: FileWriteFn,
+    /// Version 6. The feature's settings at this start: a JSON object (UTF-8, "{}" when it has
+    /// none) and its revision. Later changes come as SETTINGS_EVENT.
+    pub settings: *const u8,
+    pub settings_len: usize,
+    pub settings_revision: u64,
 }
 
 /// Version 5. AbiFileInfo::kind.

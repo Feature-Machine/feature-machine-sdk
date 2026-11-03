@@ -1,32 +1,77 @@
 {
-  "$defs": {
-    "BriefLine": {
-      "additionalProperties": false,
-      "properties": {
-        "capability": {
-          "description": "A capability of feature.json, named exactly as there (for example \"vars_read\").",
-          "type": "string"
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The answer of the safety reviewer (review/policy.md, \"Answer\").",
+  "properties": {
+    "brief": {
+      "description": "One line for each capability in feature.json, for the member.",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "capability": {
+            "description": "A capability of feature.json, named exactly as there (for example \"vars_read\").",
+            "type": "string"
+          },
+          "text": {
+            "description": "What the feature does with it, in plain words.",
+            "type": "string"
+          }
         },
-        "text": {
-          "description": "What the feature does with it, in plain words.",
-          "type": "string"
-        }
+        "required": [
+          "capability",
+          "text"
+        ],
+        "type": "object"
       },
-      "required": [
-        "capability",
-        "text"
-      ],
-      "type": "object"
+      "type": "array"
     },
-    "Decision": {
-      "enum": [
-        "approve",
-        "deny"
-      ],
-      "type": "string"
+    "cleared": {
+      "description": "Risks that the reviewer checked and found safe.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
-    "FeatureRef": {
+    "dependencies": {
+      "description": "One row for each dependency that the review read (not creator code): the powers of its\nown code. The dependency ledger keeps them (plan S2 step 2), so a later feature that uses\nthe same code is judged by them without a new read.",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "The name and version of a `read` package of dependencies.json.",
+            "type": "string"
+          },
+          "powers": {
+            "description": "The capabilities of feature.json that its code needs (for example \"direct_network\");\nempty when it needs none.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reaches": {
+            "description": "The hosts, programs, registry keys and files that its code reaches; empty when none.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "powers",
+          "reaches"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "feature": {
       "additionalProperties": false,
+      "description": "The id and version in the reviewed feature.json.",
       "properties": {
         "id": {
           "type": "string"
@@ -41,121 +86,89 @@
       ],
       "type": "object"
     },
-    "Finding": {
-      "additionalProperties": false,
-      "properties": {
-        "declared": {
-          "description": "Whether feature.json declares that power.",
-          "type": "boolean"
-        },
-        "file": {
-          "description": "Relative to the repository root, with \"/\" separators.",
-          "type": "string"
-        },
-        "line": {
-          "description": "The first line of the problem.",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "power": {
-          "description": "The power that the code uses, for example \"direct file access\".",
-          "type": "string"
-        },
-        "severity": {
-          "$ref": "#/$defs/Severity"
-        },
-        "what": {
-          "type": "string"
-        },
-        "why": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "severity",
-        "file",
-        "line",
-        "power",
-        "declared",
-        "what",
-        "why"
-      ],
-      "type": "object"
-    },
-    "PowerUse": {
-      "additionalProperties": false,
-      "properties": {
-        "declared": {
-          "description": "What feature.json declares for it (\"none\" when nothing).",
-          "type": "string"
-        },
-        "matches": {
-          "description": "True when the use stays inside the declaration.",
-          "type": "boolean"
-        },
-        "power": {
-          "type": "string"
-        },
-        "used": {
-          "description": "What the shipped code uses (\"none\" when nothing).",
-          "type": "string"
-        }
-      },
-      "required": [
-        "power",
-        "declared",
-        "used",
-        "matches"
-      ],
-      "type": "object"
-    },
-    "Severity": {
-      "enum": [
-        "high",
-        "medium",
-        "low"
-      ],
-      "type": "string"
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "additionalProperties": false,
-  "description": "The answer of the safety reviewer (review/policy.md, \"Answer\").",
-  "properties": {
-    "brief": {
-      "description": "One line for each capability in feature.json, for the member.",
-      "items": {
-        "$ref": "#/$defs/BriefLine"
-      },
-      "type": "array"
-    },
-    "cleared": {
-      "description": "Risks that the reviewer checked and found safe.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "feature": {
-      "$ref": "#/$defs/FeatureRef",
-      "description": "The id and version in the reviewed feature.json."
-    },
     "findings": {
       "description": "Safety findings only, most severe first. Empty for approve.",
       "items": {
-        "$ref": "#/$defs/Finding"
+        "additionalProperties": false,
+        "properties": {
+          "declared": {
+            "description": "Whether feature.json declares that power.",
+            "type": "boolean"
+          },
+          "file": {
+            "description": "Relative to the repository root, with \"/\" separators.",
+            "type": "string"
+          },
+          "line": {
+            "description": "The first line of the problem.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "power": {
+            "description": "The power that the code uses, for example \"direct file access\".",
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ],
+            "type": "string"
+          },
+          "what": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "file",
+          "line",
+          "power",
+          "declared",
+          "what",
+          "why"
+        ],
+        "type": "object"
       },
       "type": "array"
     },
     "powers": {
       "description": "One row for each power that the feature declares or uses.",
       "items": {
-        "$ref": "#/$defs/PowerUse"
+        "additionalProperties": false,
+        "properties": {
+          "declared": {
+            "description": "What feature.json declares for it (\"none\" when nothing).",
+            "type": "string"
+          },
+          "matches": {
+            "description": "True when the use stays inside the declaration.",
+            "type": "boolean"
+          },
+          "power": {
+            "type": "string"
+          },
+          "used": {
+            "description": "What the shipped code uses (\"none\" when nothing).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "power",
+          "declared",
+          "used",
+          "matches"
+        ],
+        "type": "object"
       },
       "type": "array"
     },
     "quality": {
-      "description": "Short notes for the public quality score; never a reason to deny.",
+      "description": "Short notes for the admin, not for members or the creator; never a reason to deny.",
       "items": {
         "type": "string"
       },
@@ -166,8 +179,12 @@
       "type": "string"
     },
     "verdict": {
-      "$ref": "#/$defs/Decision",
-      "description": "approve when there is no safety finding, else deny."
+      "description": "approve when there is no safety finding, else deny.",
+      "enum": [
+        "approve",
+        "deny"
+      ],
+      "type": "string"
     }
   },
   "required": [
@@ -178,7 +195,8 @@
     "powers",
     "brief",
     "quality",
-    "cleared"
+    "cleared",
+    "dependencies"
   ],
   "title": "Verdict",
   "type": "object"

@@ -26,5 +26,6 @@
     "Redirects stay on the declared host.",
     "The page uses textContent and makes no network call.",
     "No obfuscation, data theft, registry access or custom unsafe code in shipped code."
-  ]
+  ],
+  "dependencies": []
 }

@@ -239,8 +239,10 @@ fn span(s: &Setter, size: usize) -> (i64, usize) {
     (start, ((s.mirror + 4).max(size as i64) - start) as usize)
 }
 
+/// `slot`: the live address of the vtable slot that held `function` at resolution; the runtime
+/// reads it again before each handler use (`handler_unchanged`).
 #[derive(Clone)]
-struct Native { span: u64, len: usize, value_at: usize, mirror_at: usize, clamp: Option<(u64, u64)>, object: u64, function: u64 }
+struct Native { span: u64, len: usize, value_at: usize, mirror_at: usize, clamp: Option<(u64, u64)>, object: u64, function: u64, slot: u64 }
 
 /// `proved`: a writer may acquire it. A v2 symbol starts unproved; `Runtime::watch` proves it
 /// after `WATCH_MS` of consistent reads (`watch` holds the first time and the read count).
@@ -257,10 +259,17 @@ struct Resolved { symbol: Symbol, address: u64, guard: u64, pattern: Vec<Option<
 #[serde(deny_unknown_fields)]
 pub struct Proof { pub exe: String, pub map: String, pub version: String, pub file: String, pub symbols: BTreeMap<String, Found> }
 
-/// One symbol of a `Proof`: the RVA of its name pattern and of its class vtable.
+/// One symbol of a `Proof`: the RVA of its name pattern, of its class vtable and of the change
+/// handler in its vtable slot (None for a symbol with no setter). A record from before the
+/// handler field reads as None; `resolve_proved` refuses it for a setter, so the host deletes
+/// it once and runs the full search and watch (overnight 2026-10-26, handler slot stability).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Found { pub pattern: u64, pub vtable: u64 }
+pub struct Found {
+    pub pattern: u64, pub vtable: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<u64>,
+}
 
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
 
@@ -419,8 +428,14 @@ impl Map {
             };
             // A v2 setter must look like the contract now: value in the native clamp, mirror equal.
             if let (Some(_), Some(n)) = (&s.class_guard, &native) { setter_state(image, s, n)?; }
+            // A saved setter must name the handler of this image; a record with no handler field
+            // (older format) cannot prove it, so it is refused like any record that differs.
+            let handler = native.as_ref().map(|n| n.function - image.base);
+            if found.is_some_and(|f| handler.is_some() && f.handler != handler) {
+                return Err(Error::Unavailable(format!("{}: saved result differs from the image: handler", s.name)));
+            }
             let proved = s.class_guard.is_none() || found.is_some();
-            let found = s.class_guard.as_ref().and(vtable).map(|(_, _, vtable)| Found { pattern: at as u64, vtable });
+            let found = s.class_guard.as_ref().and(vtable).map(|(_, _, vtable)| Found { pattern: at as u64, vtable, handler });
             symbols.insert(format!("{}/{}", self.id, s.name), Resolved { symbol: s.clone(), address, guard, pattern: p, type_guard, native, proved, watch: None, found, failed: None });
         }
         for s in symbols.values().filter(|s| s.symbol.access == Access::Write) {
@@ -450,7 +465,7 @@ fn native(image: &Image, sections: &[Section], setter: &Setter, vtable_rva: u64,
     }
     let at = |o: i64| address.checked_add_signed(o).ok_or_else(bad);
     let clamp = match (setter.clamp_min, setter.clamp_max) { (Some(min), Some(max)) => Some((at(min)?, at(max)?)), _ => None };
-    Ok(Native { span: image.base + first, len, value_at: (-start) as usize, mirror_at: (setter.mirror - start) as usize, clamp, object, function })
+    Ok(Native { span: image.base + first, len, value_at: (-start) as usize, mirror_at: (setter.mirror - start) as usize, clamp, object, function, slot: image.base + slot })
 }
 
 /// One PE section of the main image, by RVA, from the headers in the image bytes.
@@ -575,6 +590,16 @@ fn guard_matches<M: Memory>(memory: &M, s: &Resolved) -> bool {
         && s.type_guard.is_none_or(|(address, expected)| memory.read(address, 8).is_ok_and(|b| b == expected))
 }
 
+/// The live vtable slot must still hold the handler of resolution: checked at the watch, acquire,
+/// each write (before its reads, write and call) and the restore. Reads skip it: they call nothing.
+/// It relies on the plan contract that the vtable does not change in use: a thread that changes the
+/// slot between this read and the call is not seen (`Writer::call` adds no lock), nor is changed
+/// code at the same address (residuals, overnight 2026-10-26).
+fn handler_unchanged<M: Memory>(memory: &M, s: &Resolved) -> Result<(), Error> {
+    if s.native.as_ref().is_none_or(|n| memory.read(n.slot, 8).is_ok_and(|b| b == n.function.to_le_bytes())) { Ok(()) }
+    else { Err(Error::Unavailable("change handler slot differs from the resolved handler".into())) }
+}
+
 /// The read-only watch of a v2 symbol before its first writer: at least 5 consistent reads over
 /// at least 10 s, all in a row. Agent choice (plan 2026-10-23 section 3): long enough to see a
 /// wrong object change on its own, short against a flight; one failure starts it again.
@@ -668,6 +693,8 @@ impl<M: Memory> Runtime<M> {
 
     /// True while `owner` holds a lease, including one whose cleanup failed.
     pub fn holds(&self, owner: &str) -> bool { self.leases.values().any(|l| l.owner == owner) }
+    /// True while lease `handle` is live and `owner` holds it (a failed release keeps it live).
+    pub fn owns(&self, owner: &str, handle: u64) -> bool { self.leases.get(&handle).is_some_and(|l| l.owner == owner) }
     pub fn leased(&self) -> bool { !self.leases.is_empty() }
 
     /// Host-owned access for adapter maintenance and test fault injection; never exposed in ABI.
@@ -711,6 +738,7 @@ impl<M: Memory> Runtime<M> {
     pub fn acquire(&mut self, owner: &str, key: &str) -> Result<u64, Error> {
         if owner.is_empty() || self.disconnected || self.stopped.contains(owner) { return Err(Error::Refused); }
         let s = self.checked(key)?;
+        handler_unchanged(&self.memory, s)?;
         if s.symbol.access != Access::Write { return Err(Error::Refused); }
         // The read-only watch ends by itself: Busy, so a writer tries again later (fm_feature_sdk
         // retries Busy and the host logs no line for it), as for a lease of another feature.
@@ -729,6 +757,7 @@ impl<M: Memory> Runtime<M> {
         let l = self.leases.get(&handle).ok_or(Error::Refused)?;
         if l.owner != owner || l.failed || self.stopped.contains(owner) { return Err(Error::Refused); }
         let s = self.checked(&l.key)?.clone();
+        handler_unchanged(&self.memory, &s)?;
         validate(&s.symbol, value)?;
         if !self.memory.can_write() { return Err(Error::Unavailable("not at the qualified execution point".into())); }
         let (address, n) = s.storage();
@@ -783,6 +812,10 @@ impl<M: Memory> Runtime<M> {
         let current = self.memory.read(address, l.original.len())?;
         if current == l.original && !l.notify { self.leases.remove(&handle); return Ok(()); }
         if current != l.original && Some(&current) != l.expected.as_ref() { return Err(Error::Conflict); }
+        // A restore writes and calls the handler, so a changed slot refuses it as a class change
+        // does: no write, no call, the lease stays and a later cleanup tries again. A lease with
+        // nothing to restore (above) still ends: its object guard holds and it calls nothing.
+        handler_unchanged(&self.memory, &s)?;
         if !self.memory.can_write() { return Err(Error::Unavailable("not at the qualified execution point".into())); }
         let original = l.original.clone();
         let l = self.leases.get_mut(&handle).unwrap();
@@ -860,6 +893,7 @@ impl<M: Memory> Runtime<M> {
 
     fn consistent(&self, key: &str) -> Result<(), Error> {
         let s = self.checked(key)?;
+        handler_unchanged(&self.memory, s)?;
         let Some(n) = &s.native else { return self.read(key).map(|_| ()) };
         let span = self.memory.read(n.span, n.len)?;
         setter_consistent(&s.symbol, n, &span, |a| self.memory.read(a, s.symbol.kind.size()).and_then(|b| s.symbol.kind.decode(&b)).map(Scalar::number))
