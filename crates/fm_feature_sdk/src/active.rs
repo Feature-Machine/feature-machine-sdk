@@ -310,7 +310,6 @@ impl ActiveList {
 /// True when `exe` is inside `dir`. Both are canonical when they can be (links, "..", the long
 /// form); Windows paths compare with no case and either slash, like the app's install match.
 fn in_folder(exe: &Path, dir: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let text = |p: PathBuf| {
         let t = p.to_string_lossy().replace('/', std::path::MAIN_SEPARATOR_STR);
         let t = t.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(t);
@@ -319,6 +318,24 @@ fn in_folder(exe: &Path, dir: &Path) -> bool {
     let (e, d) = (text(canon(exe)), text(canon(dir)));
     let d = d.trim_end_matches(std::path::MAIN_SEPARATOR);
     e.len() > d.len() && e.starts_with(d) && e[d.len()..].starts_with(std::path::MAIN_SEPARATOR)
+}
+
+/// The canonical form of the nearest part of `p` that exists, plus the rest of `p`. A path that
+/// does not exist (yet) then has the same form as an existing folder above it: with only a
+/// fallback to the raw path, an 8.3 short name (C:\Users\RUNNER~1, the GitHub runner) never
+/// matched the long name of the canonical folder (SDK 0.3.0 CI). A ".." in the rest stays raw.
+fn canon(p: &Path) -> PathBuf {
+    let mut rest = vec![];
+    let mut cur = p;
+    loop {
+        if let Ok(found) = std::fs::canonicalize(cur) {
+            return rest.iter().rev().fold(found, |acc, name| acc.join(name));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => { rest.push(name.to_os_string()); cur = parent; }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 #[cfg(test)]

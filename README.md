@@ -20,7 +20,7 @@ Feature Machine hosts load in a reviewed application process or a separate Featu
    crate-type = ["cdylib", "rlib"]
 
    [dependencies]
-   fm_feature_sdk = { git = "https://github.com/Feature-Machine/feature-machine-sdk", tag = "v0.3.0" }
+   fm_feature_sdk = { git = "https://github.com/Feature-Machine/feature-machine-sdk", tag = "v0.3.1" }
    ```
 
 2. Add `feature.json` next to `Cargo.toml`.
