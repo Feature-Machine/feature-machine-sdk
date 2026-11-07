@@ -8,8 +8,11 @@ mod deps;
 mod feed;
 mod map;
 mod module;
+mod notice;
+mod policy;
 mod repack;
 mod review;
+mod review_eval;
 mod review_run;
 mod shaders;
 use sha2::Digest;
@@ -27,6 +30,7 @@ fn main() -> ExitCode {
         ["prepare", repo, commit, dir, out] => build::prepare(repo, commit, dir, out),
         ["build-prepared", dir] => build::build_prepared(dir),
         ["review-run", dir, repository] => review_run::command(dir, repository),
+        ["review-eval", rest @ ..] => review_eval::command(rest),
         ["deps", dir] => deps::command(dir),
         ["review-brief", dir, verdict] => review::command(dir, verdict),
         ["repack", zip, lib, out] => repack::command(zip, lib, out),
@@ -44,7 +48,9 @@ fn main() -> ExitCode {
         ["memory-session", dir, libs @ ..] if !libs.is_empty() => memory_session(dir, libs),
         ["map", rest @ ..] => map::command(rest),
         [cmd, ..] if cmd.starts_with("module") => module::command(&args),
-        _ => Err(format!("usage: fm_pack zip <dir> <out.zip> | fm_pack setup <stub> <zip> <sig> <version> <out> | fm_pack setup-check <setup> <zip> <version> | fm_pack feature <dir> <out.zip> <library>... | fm_pack build <repo> <commit> <feature dir> <out dir> | fm_pack prepare <repo> <commit> <feature dir> <out dir> | fm_pack build-prepared <out dir of prepare> | fm_pack review-run <out dir of prepare> <owner/repository> (OPENROUTER_API_KEY, FM_REVIEW_MODEL) | fm_pack deps <build dir> | fm_pack review-brief <build dir> <verdict.json> | fm_pack repack <zip> <signed feature.dll> <out.zip> | fm_pack shaders <dir> <out dir> | fm_pack dxc (path of the pinned compiler) | fm_pack catalog <feed> <zip> [preview] (needs <zip>.sig) | fm_pack inspect <zip> | fm_pack feed-init <feed> | fm_pack promote <feed> <id> <version> | fm_pack withdraw <feed> <id> <version> (a module: yank) | {} | {}", map::USAGE, module::USAGE)),
+        [cmd, ..] if cmd.starts_with("policy") => policy::command(&args),
+        [cmd, ..] if cmd.starts_with("notice") => notice::command(&args),
+        _ => Err(format!("usage: fm_pack zip <dir> <out.zip> | fm_pack setup <stub> <zip> <sig> <version> <out> | fm_pack setup-check <setup> <zip> <version> | fm_pack feature <dir> <out.zip> <library>... | fm_pack build <repo> <commit> <feature dir> <out dir> | fm_pack prepare <repo> <commit> <feature dir> <out dir> | fm_pack build-prepared <out dir of prepare> | fm_pack review-run <out dir of prepare> <owner/repository> (OPENROUTER_API_KEY, FM_REVIEW_MODEL) | {} | fm_pack deps <build dir> | fm_pack review-brief <build dir> <verdict.json> | fm_pack repack <zip> <signed feature.dll> <out.zip> | fm_pack shaders <dir> <out dir> | fm_pack dxc (path of the pinned compiler) | fm_pack catalog <feed> <zip> [preview] (needs <zip>.sig) | fm_pack inspect <zip> | fm_pack feed-init <feed> | fm_pack promote <feed> <id> <version> | fm_pack withdraw <feed> <id> <version> (a module: yank) | {} | {} | {} | {}", review_eval::USAGE, map::USAGE, module::USAGE, policy::USAGE, notice::USAGE)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -263,7 +269,7 @@ fn catalog_art(zip: &[u8], m: &fm_install::feature::Manifest) -> Result<Art, Str
 /// package or a module catalog gives the version that its signature is for (module.rs).
 fn inspect(zip: &str) -> Result<(), String> {
     let bytes = std::fs::read(zip).map_err(|e| format!("{zip}: {e}"))?;
-    if let Some(v) = module::inspect(&bytes) {
+    if let Some(v) = policy::inspect(&bytes).or_else(|| notice::inspect(&bytes)).or_else(|| module::inspect(&bytes)) {
         println!("{v}");
         return Ok(());
     }

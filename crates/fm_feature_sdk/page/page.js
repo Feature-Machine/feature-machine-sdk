@@ -12,7 +12,12 @@
   var parent = window.parent;
   // No prototype: any topic name ("constructor", "__proto__") is a plain key (Sol r1).
   var topics = Object.create(null);
-  var state = { sessions: [], settings: {}, revision: null, theme: null };
+  var state = { sessions: [], settings: {}, schema: [], revision: null, theme: null, game: null };
+  // The newest message of each topic per session ("game:pid"), so a part that a page builds
+  // later (a session block of kit.js) shows the current values at once. A new start of the
+  // feature in a session (another activation) drops the values of the old start.
+  var last = Object.create(null);
+  var starts = Object.create(null);
   var waits = Object.create(null);
   var next = 1;
   var beat = null;
@@ -49,17 +54,48 @@
     });
   }
 
+  function key(s) {
+    return s.game + ":" + s.pid;
+  }
+
+  // Keeps the newest messages of the sessions that still exist and of their current start only.
+  function keepLast(sessions) {
+    var now = Object.create(null);
+    sessions.forEach(function (s) {
+      var k = key(s);
+      var start = s.feature ? String(s.instance) + "/" + String(s.feature.activation) : null;
+      if (start !== null && starts[k] !== undefined && starts[k] !== start) delete last[k];
+      if (start !== null) starts[k] = start;
+      now[k] = true;
+    });
+    Object.keys(last).forEach(function (k) {
+      if (!now[k]) delete last[k];
+    });
+    Object.keys(starts).forEach(function (k) {
+      if (!now[k]) delete starts[k];
+    });
+  }
+
   window.addEventListener("message", function (e) {
     var m = e.data;
     if (e.source !== parent || !m || m.fm !== 1) return;
     switch (m.kind) {
       case "sessions":
         state.sessions = Array.isArray(m.sessions) ? m.sessions : [];
+        keepLast(state.sessions);
         fire("fm:sessions", [copy(state.sessions)]);
         break;
       case "message":
         // "fm:" topics are the app's events: a feature message never fires them.
-        if (typeof m.topic === "string" && m.topic.indexOf("fm:") !== 0) fire(m.topic, [m.data, { game: m.game, pid: m.pid }]);
+        if (typeof m.topic === "string" && m.topic.indexOf("fm:") !== 0) {
+          var k = key(m);
+          (last[k] = last[k] || Object.create(null))[m.topic] = m.data;
+          fire(m.topic, [m.data, { game: m.game, pid: m.pid }]);
+        }
+        break;
+      case "schema":
+        state.schema = Array.isArray(m.settings) ? m.settings : [];
+        fire("fm:schema", [copy(state.schema)]);
         break;
       case "settings":
         state.settings = m.values && typeof m.values === "object" ? m.values : {};
@@ -74,6 +110,12 @@
         else w.resolve();
         break;
       }
+      case "context":
+        // The game of the page's home (2026-11-04): the app sends only its sessions, so a
+        // page can show the right words and behavior for it. Null: the page has no home.
+        state.game = typeof m.game === "string" && /^[a-z0-9_-]{1,32}$/.test(m.game) ? m.game : null;
+        fire("fm:context", [{ game: state.game }]);
+        break;
       case "theme":
         if (m.theme && typeof m.theme === "object") {
           state.theme = m.theme;
@@ -89,8 +131,9 @@
 
   window.fm = {
     version: 1,
-    // A message topic of the feature, or an app event: "fm:sessions", "fm:settings", "fm:theme",
-    // "fm:send_failed" (feature topics never start with "fm:"). Gives a function that stops it.
+    // A message topic of the feature, or an app event: "fm:context", "fm:sessions", "fm:settings",
+    // "fm:schema", "fm:theme", "fm:send_failed" (feature topics never start with "fm:"). Gives a
+    // stop function.
     on: function (topic, fn) {
       (topics[topic] = topics[topic] || []).push(fn);
       return function () {
@@ -111,8 +154,22 @@
     sessions: function () {
       return copy(state.sessions);
     },
+    // The game id of the page's home ("ats", "msfs2024", ...), or null before the context.
+    game: function () {
+      return state.game;
+    },
     settings: function () {
       return copy(state.settings);
+    },
+    // The settings of feature.json for the version of this page (id, label, type, options, ...).
+    schema: function () {
+      return copy(state.schema);
+    },
+    // The newest data of `topic` from one session ({ game, pid }) of the current start, or
+    // undefined.
+    last: function (topic, session) {
+      var t = session ? last[key(session)] : undefined;
+      return t ? copy(t[topic]) : undefined;
     },
     // Writes one setting of the feature through the app (the same check as Manage). The promise
     // ends when the app stored it; the new values come with "fm:settings".

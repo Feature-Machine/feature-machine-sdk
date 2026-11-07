@@ -1,0 +1,11 @@
+[
+  {
+    "id": "ats-truckersmp-gameplay",
+    "game": "ats",
+    "when": { "multiplayer": ["truckersmp"] },
+    "deny": ["input_inject", "game_command"],
+    "apply": "now",
+    "reason": "TruckersMP does not allow tools that change gameplay.",
+    "since": 0
+  }
+]

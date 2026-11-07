@@ -146,18 +146,25 @@ impl ControlDecl {
 
 pub const STORE_VERSION: u32 = 1;
 
+/// The bindings of the features: feature id, then control id, then its bindings.
+pub type FeatureBindings = BTreeMap<String, BTreeMap<String, Vec<Binding>>>;
+
 /// controls.json: feature id, then control id, then its bindings. A control with no entry uses
-/// its default; an empty list means the member removed all bindings.
+/// its default; an empty list means the member removed all bindings. `installs`: per-install
+/// setup (app plan 2026-11-03), the bindings of each game install by install id; `features`
+/// then stays the form that an older app reads (it drops `installs` at its next save).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Store {
     pub version: u32,
     #[serde(default)]
-    pub features: BTreeMap<String, BTreeMap<String, Vec<Binding>>>,
+    pub features: FeatureBindings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installs: Option<BTreeMap<String, FeatureBindings>>,
 }
 
 /// An empty store has the current version, so it saves as a file that `from_json` reads.
 impl Default for Store {
-    fn default() -> Self { Store { version: STORE_VERSION, features: BTreeMap::new() } }
+    fn default() -> Self { Store { version: STORE_VERSION, features: BTreeMap::new(), installs: None } }
 }
 
 impl Store {
@@ -165,6 +172,16 @@ impl Store {
         let s: Store = serde_json::from_str(text).map_err(|e| e.to_string())?;
         if s.version != STORE_VERSION { return Err(format!("controls.json version {} is not {STORE_VERSION}", s.version)); }
         Ok(s)
+    }
+
+    /// The store that a game of `install` uses: the bindings of that install after the
+    /// per-install migration (an install with no entry: the defaults), else the feature bindings.
+    pub fn for_install(&self, install: Option<&str>) -> Store {
+        let features = match (&self.installs, install) {
+            (Some(by), Some(i)) => by.get(i).cloned().unwrap_or_default(),
+            _ => self.features.clone(),
+        };
+        Store { version: self.version, features, installs: None }
     }
 
     /// The bindings of one control: the member's, else the default.

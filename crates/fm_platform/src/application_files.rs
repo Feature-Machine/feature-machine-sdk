@@ -4,7 +4,7 @@
 // Machine is not replaced or removed without a new question. A write goes to a temporary file
 // in the same folder and then a rename, so the game never loads half a file.
 use crate::files::write_replace;
-use crate::Game;
+use crate::ApplicationId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io;
@@ -28,7 +28,7 @@ pub fn ats_plugin_build_name() -> String {
 /// One installed file, with the user's consent (time and app version) as proof.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
-    pub game: Game,
+    pub game: ApplicationId,
     pub install_dir: PathBuf,
     pub path: PathBuf,
     pub sha256: String,
@@ -297,7 +297,7 @@ mod tests {
 
     fn record(dir: &Path) -> Record {
         Record {
-            game: Game::Ats,
+            game: ApplicationId::ATS,
             install_dir: dir.into(),
             path: dir.join("feature_machine.dll"),
             sha256: String::new(),

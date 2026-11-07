@@ -242,7 +242,8 @@ pub const RENDER_MIRAGE_STRONG: u32 = 4;
 
 /// Version 5. Stages of a shader pass (AbiShader::stage). FINAL: the presented image with the
 /// game UI. SCENE: the game's HDR scene before tone mapping and UI. SCENE_DEPTH: the scene with
-/// the depth in fm_depth (also needs the render_depth capability).
+/// the depth in fm_depth and, from app 0.2.0-preview.10, the surface ids in fm_surface with
+/// fm_grass (also needs the render_depth capability).
 pub const SHADER_FINAL: u32 = 0;
 pub const SHADER_SCENE: u32 = 1;
 pub const SHADER_SCENE_DEPTH: u32 = 2;

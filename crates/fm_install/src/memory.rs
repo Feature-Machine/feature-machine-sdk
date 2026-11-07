@@ -152,7 +152,7 @@ fn allowed(m: &Manifest, map: &Signed) -> Result<(), String> {
         return Err(format!("{}: map contract differs from map_contracts", map.id()));
     }
     if !m.games.iter().any(|game| serde_json::to_value(game).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(map.game())) {
-        return Err("map is for another game".into());
+        return Err("map is for another application".into());
     }
     Ok(())
 }
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn a_camera_only_feature_takes_only_camera_maps_for_its_games() {
         let (files, _) = camera_files(locator_map("ats"));
-        assert!(crate::feature::inspect(std::io::Cursor::new(archive(&files))).unwrap_err().to_string().contains("another game"));
+        assert!(crate::feature::inspect(std::io::Cursor::new(archive(&files))).unwrap_err().to_string().contains("another application"));
         let scalar = serde_json::json!({ "kind": "memory-map", "contract": "anchored-scalar-v1", "map": { "schema": 1, "id": "cam-scalar", "version": "1.0.0",
             "game": "msfs2024", "module": "x.exe", "sha256": "a".repeat(64),
             "symbols": [{ "name": "s", "pattern": "01 02 03 04", "offset": 8, "kind": "f32", "access": "read", "min": 0.0, "max": 1.0 }] } });

@@ -5,7 +5,7 @@
 // loop pass; a check runs each LIST_CHECK, which also retries the items that wait (Admit::Wait).
 use crate::active::ActiveList;
 use crate::host::{FeatureSet, State};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 /// An app link lost less than this ago still counts: the features keep running through a short
@@ -32,7 +32,12 @@ pub struct List {
     linked_at: Option<Instant>,
     /// Lines for the host log, taken with `diagnostics`.
     diag: Vec<String>,
+    /// The game and the program of this process: each read keeps only the features of its
+    /// install (ActiveList::for_exe). None: the whole list (a host that cannot read its exe).
+    scope: Option<Scope>,
 }
+
+enum Scope { Executable(String, PathBuf), Install(String, String) }
 
 /// What `List::check` decided for this pass.
 #[derive(Debug, PartialEq)]
@@ -49,7 +54,19 @@ pub enum Check {
 impl List {
     /// `file`: <features dir>/active.json; None when the host has no per-user data folder.
     pub fn new(file: Option<PathBuf>, now: Instant) -> Self {
-        List { file, list: ActiveList::default(), error: None, stamp: None, next_check: now, linked_at: None, diag: vec![] }
+        List { file, list: ActiveList::default(), error: None, stamp: None, next_check: now, linked_at: None, diag: vec![], scope: None }
+    }
+
+    /// The list of one install (per-install setup): `game` and `exe`, the program of this process.
+    pub fn scoped(mut self, game: &str, exe: Option<&Path>) -> Self {
+        self.scope = exe.map(|e| Scope::Executable(game.to_string(), e.to_path_buf()));
+        self
+    }
+
+    /// A separate helper follows only the explicitly granted install on every list read.
+    pub fn scoped_install(mut self, application: &str, install: &str) -> Self {
+        self.scope = Some(Scope::Install(application.into(), install.into()));
+        self
     }
 
     /// Why the list cannot be read now (for HostReport.error); None: the last read was good.
@@ -77,10 +94,21 @@ impl List {
         let stamp = std::fs::metadata(file).ok().map(|m| (m.modified().ok(), m.len()));
         if force || stamp != self.stamp {
             self.stamp = stamp;
-            match ActiveList::load(file) {
-                Ok(l) => (self.list, self.error) = (l, None),
+            let loaded = ActiveList::load(file).and_then(|l| match &self.scope {
+                Some(Scope::Executable(game, exe)) => Ok(l.for_exe(game, exe)),
+                Some(Scope::Install(application, install)) => l.for_install(application, install),
+                None => Ok(l),
+            });
+            match loaded {
+                Ok(l) => {
+                    (self.list, self.error) = (l, None)
+                }
                 Err(e) => {
-                    self.diag.push(format!("ERROR: feature list: {e}; the running features stay"));
+                    let outcome = if matches!(self.scope, Some(Scope::Install(..))) {
+                        self.list = ActiveList::default();
+                        "the install grant is closed"
+                    } else { "the running features stay" };
+                    self.diag.push(format!("ERROR: feature list: {e}; {outcome}"));
                     self.error = Some(e);
                 }
             }
@@ -192,6 +220,48 @@ mod tests {
         assert_eq!(l.check(t, true, true), Check::Follow { read: true });
         assert_eq!(ids(&l), ["a", "c"]);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Per-install setup: a scoped list keeps the features of the install of its exe at each read,
+    /// so a feature turned on in another install never starts in this game.
+    #[test]
+    fn a_scoped_list_follows_its_own_install() {
+        let file = list_file("scope");
+        let write = |steam: &[&str]| {
+            let features: Vec<_> = ["a", "b"].iter().map(|id| serde_json::json!({ "id": id, "version": "1.0.0", "library": "x", "games": ["ats"], "capabilities": [] })).collect();
+            let installs = serde_json::json!([{ "id": "s", "game": "ats", "dir": "/lib1/ATS", "features": steam }, { "id": "t", "game": "ats", "dir": "/lib2/ATS", "features": ["a", "b"] }]);
+            std::fs::write(&file, serde_json::json!({ "features": features, "installs": installs }).to_string()).unwrap();
+        };
+        write(&["a"]);
+        let t0 = Instant::now();
+        let mut l = List::new(Some(file.clone()), t0).scoped("ats", Some(Path::new("/lib1/ATS/bin/win_x64/amtrucks.exe")));
+        assert_eq!(l.check(t0, true, true), Check::Follow { read: true });
+        assert_eq!(ids(&l), ["a"]);
+        write(&["a", "b"]);
+        assert_eq!(l.check(t0, true, true), Check::Follow { read: true });
+        assert_eq!(ids(&l), ["a", "b"]);
+        let mut whole = List::new(Some(file.clone()), t0);
+        whole.check(t0, true, true);
+        assert_eq!(ids(&whole), ["a", "b"], "no scope: the whole list");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    // An external grant must remain present on each read. Damage or a removed install closes
+    // its selection so a helper cannot keep authority from a previously valid file.
+    #[test]
+    fn an_external_list_loses_its_selection_when_the_grant_is_removed() {
+        let file = list_file("external");
+        let features = serde_json::json!([{"id":"a","version":"1.0.0","library":"x","games":["ats"],"capabilities":[]}]);
+        let save = |installs: serde_json::Value| std::fs::write(&file, serde_json::json!({"features":features,"installs":installs}).to_string()).unwrap();
+        save(serde_json::json!([{"id":"s","game":"ats","dir":"/vendor","features":["a"]}]));
+        let now = Instant::now();
+        let mut list = List::new(Some(file.clone()), now).scoped_install("ats", "s");
+        assert_eq!(list.check(now, true, true), Check::Follow { read: true });
+        assert_eq!(ids(&list), ["a"]);
+        save(serde_json::json!([]));
+        assert_eq!(list.check(now, true, true), Check::Follow { read: false });
+        assert!(ids(&list).is_empty());
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
     /// A damaged file keeps the last good list, says why and gives one log line; a missing file

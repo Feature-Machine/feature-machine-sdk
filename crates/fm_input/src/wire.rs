@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 
 /// Bump when a message changes in a way that an older app or reader can not read.
 /// 2: Learn and Learned carry the learn id. 3: Access. 4: feature versions in Controls and Games.
-pub const WIRE_VERSION: u32 = 4;
+/// 5: the store has the bindings per install, and each game session names its install.
+pub const WIRE_VERSION: u32 = 5;
 
 /// The controls of one feature version. A game runs the version that it started with until it
 /// ends, so two versions of a feature can run at the same time (one per game).
@@ -32,6 +33,9 @@ pub struct GameSession {
     /// older host or app.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub starts: BTreeMap<String, u64>,
+    /// The game install of the session (per-install setup): its bindings (Store::for_install).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -93,7 +97,7 @@ mod tests {
         assert_eq!(line, r#"{"t":"control","feature":"rain","control":"toggle","kind":"button","value":true}"#);
         assert_eq!(serde_json::from_str::<FromReader>(&line).unwrap(), c);
         let g: ToReader = serde_json::from_str(r#"{"t":"games","sessions":[{"pid":42,"features":[{"id":"rain","version":"1.0.0"}]}]}"#).unwrap();
-        assert_eq!(g, ToReader::Games { sessions: vec![GameSession { pid: 42, features: vec![FeatureRef::new("rain", "1.0.0")], starts: Default::default() }] });
+        assert_eq!(g, ToReader::Games { sessions: vec![GameSession { pid: 42, features: vec![FeatureRef::new("rain", "1.0.0")], starts: Default::default(), install: None }] });
         let a: FromReader = serde_json::from_str(r#"{"t":"access","keyboard_mouse":false}"#).unwrap();
         assert_eq!(a, FromReader::Access { keyboard_mouse: false });
         let l: ToReader = serde_json::from_str(r#"{"t":"learn","kind":"axis","id":7}"#).unwrap();

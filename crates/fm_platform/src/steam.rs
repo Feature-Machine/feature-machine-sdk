@@ -4,14 +4,14 @@
 use std::path::{Path, PathBuf};
 use steamlocate::{app::StateFlag, SteamDir};
 
-use crate::games::{GameInstall, Source, CATALOG};
+use crate::applications::{ApplicationInstall, Source, CATALOG};
 
-pub fn installs() -> Vec<GameInstall> {
-    let mut out: Vec<GameInstall> = Vec::new();
+pub fn installs() -> Vec<ApplicationInstall> {
+    let mut out: Vec<ApplicationInstall> = Vec::new();
     for dir in steamlocate::locate_all().unwrap_or_default() {
         for i in installs_in(&dir) {
             // Linux can expose one Steam folder under two paths (~/.steam/steam and ~/.local/share/Steam).
-            if !out.iter().any(|o| crate::games::same_path(&o.install_dir, &i.install_dir)) {
+            if !out.iter().any(|o| crate::applications::same_path(&o.install_dir, &i.install_dir)) {
                 out.push(i);
             }
         }
@@ -20,9 +20,9 @@ pub fn installs() -> Vec<GameInstall> {
 }
 
 /// Catalog games in one Steam folder. Public in the crate for tests with a fixture folder.
-pub(crate) fn installs_in(steam: &SteamDir) -> Vec<GameInstall> {
+pub(crate) fn installs_in(steam: &SteamDir) -> Vec<ApplicationInstall> {
     let mut out = Vec::new();
-    for def in CATALOG {
+    for def in CATALOG.iter() {
         let Some(exe_rel) = def.exe_rel else { continue };
         let Ok(Some((app, lib))) = steam.find_app(def.steam_app_id) else { continue };
         // libraryfolders.vdf can store the path in lower case; the canonical on-disk form is
@@ -33,15 +33,15 @@ pub(crate) fn installs_in(steam: &SteamDir) -> Vec<GameInstall> {
         let exe = join_rel(&install_dir, exe_rel);
         let flags: Vec<StateFlag> = app.state_flags.map(|f| f.flags().collect()).unwrap_or_default();
         let ready = flags.contains(&StateFlag::FullyInstalled) && !flags.contains(&StateFlag::UpdateRequired);
-        out.push(GameInstall {
-            game: def.game,
+        out.push(ApplicationInstall {
+            game: def.application,
             source: Source::Steam,
             version: crate::version::file_version(&exe),
             install_dir,
             exe,
             steam_build_id: app.build_id,
             ready,
-            running_pid: None,
+            source_key: None, instances: vec![], service: None, error: None, running_pid: None,
         });
     }
     out
@@ -54,7 +54,7 @@ fn join_rel(base: &Path, rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::games::Game;
+    use crate::applications::ApplicationId;
     use std::fs;
 
     // A Steam folder like the one of a test PC: ATS in the main library, MSFS in a second library, plus a
@@ -88,8 +88,8 @@ mod tests {
         let root = fixture(4);
         let steam = SteamDir::from_dir(&root.path().join("Steam")).unwrap();
         let v = installs_in(&steam);
-        let ats = v.iter().find(|i| i.game == Game::Ats);
-        let msfs = v.iter().find(|i| i.game == Game::Msfs2024);
+        let ats = v.iter().find(|i| i.game == ApplicationId::ATS);
+        let msfs = v.iter().find(|i| i.game == ApplicationId::MSFS2024);
         if cfg!(any(windows, target_os = "linux")) {
             let ats = ats.expect("ATS found");
             assert!(ats.install_dir.ends_with("Steam/steamapps/common/American Truck Simulator"));
@@ -111,7 +111,7 @@ mod tests {
     fn update_required_is_not_ready() {
         let root = fixture(6); // FullyInstalled + UpdateRequired
         let steam = SteamDir::from_dir(&root.path().join("Steam")).unwrap();
-        let ats = installs_in(&steam).into_iter().find(|i| i.game == Game::Ats).unwrap();
+        let ats = installs_in(&steam).into_iter().find(|i| i.game == ApplicationId::ATS).unwrap();
         assert!(!ats.ready);
     }
 }

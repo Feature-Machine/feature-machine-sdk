@@ -174,9 +174,85 @@ pub struct HostReport {
     pub user_root: Option<String>,
 }
 
+/// When a game policy applies (game policies plan; fm_install::policy uses the same type). A
+/// multiplayer policy names the clients, in lower case, that the host detects ("truckersmp").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum When {
+    Always,
+    Multiplayer(Vec<String>),
+}
+
+/// What a policy does to a game that runs (decision D4): stop the feature at once, or let the
+/// running start go on and refuse each new start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Apply {
+    #[default]
+    Now,
+    NextStart,
+}
+
+/// One game policy that stops one feature in one game. The app writes it from the policy verdict
+/// (fm_install::policy) and the host applies it (FeatureSet::sync, set_multiplayer). The list
+/// carries it, not the feature record, because a running session keeps its own record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyStop {
+    pub feature: String,
+    /// The version that the policy hits (a session keeps its own version, which can have other
+    /// powers than the installed one). None: every version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub game: String,
+    pub when: When,
+    #[serde(default)]
+    pub apply: Apply,
+    /// The policy id and its reason, for the host log and the feature state.
+    pub policy: String,
+    pub reason: String,
+}
+
+impl PolicyStop {
+    /// True when the policy is for this record of a feature (its id, and its version if set).
+    pub fn is_for(&self, f: &ActiveFeature) -> bool {
+        self.feature == f.id && self.version.as_ref().is_none_or(|v| *v == f.version)
+    }
+
+    /// True when the policy applies with this multiplayer client (None: single player). Client
+    /// names compare with no case: the host reports "TruckersMP", policies write "truckersmp".
+    pub fn applies(&self, client: Option<&str>) -> bool {
+        match &self.when {
+            When::Always => true,
+            When::Multiplayer(clients) => client.is_some_and(|c| clients.iter().any(|x| x.eq_ignore_ascii_case(c))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ActiveList {
     pub features: Vec<ActiveFeature>,
+    /// Per-install setup (app plan 2026-11-03): each game install with the features that are on
+    /// there. None: an app before per-install setup, and every listed feature runs in every
+    /// install of its games.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installs: Option<Vec<ActiveInstall>>,
+    /// Game policies that stop listed features (PolicyStop). Hosts before policies ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stops: Vec<PolicyStop>,
+}
+
+/// One game install in active.json: its id (the app's GameInstall::id), game, folder and the ids
+/// of the features that run in it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActiveInstall {
+    pub id: String,
+    pub game: String,
+    pub dir: PathBuf,
+    pub features: Vec<String>,
+    /// The settings file of each feature in this install (settings::install_path). A feature
+    /// with no entry reads the file of ActiveFeature.settings.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub settings: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl ActiveList {
@@ -195,8 +271,111 @@ impl ActiveList {
         }
     }
 
+    /// The list for the game process of `game` whose program is `exe`: only the features of the
+    /// install that has `exe` in its folder. A list with no installs is kept whole; an exe that is
+    /// in no listed install gets no feature (a new install starts empty, 2026-11-03).
+    pub fn for_exe(self, game: &str, exe: &Path) -> ActiveList {
+        let Some(installs) = &self.installs else { return self };
+        let Some(mine) = installs.iter().find(|i| i.game == game && in_folder(exe, &i.dir)) else {
+            return ActiveList { features: vec![], ..self };
+        };
+        // Each kept feature reads the settings file of this install.
+        let features = self
+            .features
+            .into_iter()
+            .filter(|f| mine.features.contains(&f.id))
+            .map(|f| ActiveFeature { settings: mine.settings.get(&f.id).cloned().or(f.settings), ..f })
+            .collect();
+        ActiveList { features, installs: self.installs.clone(), stops: self.stops.clone() }
+    }
+
+    /// External helpers have no target executable folder. One explicit install must match
+    /// both identity and application; old global lists cannot authorize an external host.
+    pub fn for_install(self, application: &str, install: &str) -> Result<ActiveList, String> {
+        let installs = self.installs.as_ref().ok_or("the external host needs a per-install list")?;
+        let matches: Vec<_> = installs.iter().filter(|i| i.id == install).collect();
+        let [mine] = matches.as_slice() else { return Err("the install grant is missing or ambiguous".into()) };
+        if mine.game != application { return Err("the install grant names another application".into()); }
+        let features = self.features.iter().filter(|f| mine.features.contains(&f.id) && f.games.iter().any(|a| a == application))
+            .map(|f| ActiveFeature { settings: mine.settings.get(&f.id).cloned().or(f.settings.clone()), ..f.clone() }).collect();
+        Ok(ActiveList { features, ..self })
+    }
+
     /// The features for one game.
     pub fn for_game<'a>(&'a self, game: &'a str) -> impl Iterator<Item = &'a ActiveFeature> {
         self.features.iter().filter(move |f| f.games.iter().any(|g| g == game))
+    }
+}
+
+/// True when `exe` is inside `dir`. Both are canonical when they can be (links, "..", the long
+/// form); Windows paths compare with no case and either slash, like the app's install match.
+fn in_folder(exe: &Path, dir: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let text = |p: PathBuf| {
+        let t = p.to_string_lossy().replace('/', std::path::MAIN_SEPARATOR_STR);
+        let t = t.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(t);
+        if cfg!(windows) { t.to_lowercase() } else { t }
+    };
+    let (e, d) = (text(canon(exe)), text(canon(dir)));
+    let d = d.trim_end_matches(std::path::MAIN_SEPARATOR);
+    e.len() > d.len() && e.starts_with(d) && e[d.len()..].starts_with(std::path::MAIN_SEPARATOR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feature(id: &str) -> ActiveFeature {
+        ActiveFeature { id: id.into(), version: "1.0.0".into(), library: "x".into(), games: vec!["msfs2024".into()], capabilities: vec![], multiplayer: Multiplayer::Allowed, game_commands: vec![], network_hosts: vec![], memory_maps: vec![], data_dir: None, user_files: vec![], requires: vec![], settings: None }
+    }
+
+    // External hosts select one exact install, independent of their own executable folder.
+    // An absent, duplicate or wrong-application grant must never inherit the global list.
+    #[test]
+    fn an_external_host_requires_one_matching_install() {
+        let install = |id: &str, game: &str, ids: &[&str]| ActiveInstall { id: id.into(), game: game.into(), dir: "/vendor".into(), features: ids.iter().map(|s| s.to_string()).collect(), settings: Default::default() };
+        let mut a = install("a", "msfs2024", &["one"]);
+        a.settings.insert("one".into(), "/data/one/installs/a/settings.json".into());
+        let list = ActiveList { features: vec![feature("one"), feature("two")], installs: Some(vec![a.clone(), install("b", "msfs2024", &["two"])]), ..Default::default() };
+        let selected = list.clone().for_install("msfs2024", "a").unwrap();
+        assert_eq!(selected.features.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["one"]);
+        assert_eq!(selected.features[0].settings, a.settings.get("one").cloned());
+        assert!(list.clone().for_install("ats", "a").is_err());
+        assert!(list.clone().for_install("msfs2024", "missing").is_err());
+        assert!(ActiveList { installs: None, ..list.clone() }.for_install("msfs2024", "a").is_err());
+        assert!(ActiveList { installs: Some(vec![a.clone(), a]), ..list }.for_install("msfs2024", "a").is_err());
+    }
+
+    // Per-install setup: a host keeps only the features of the install that its exe is in; a
+    // list from an older app (no installs) stays whole; an exe in no install gets nothing.
+    #[test]
+    fn a_host_keeps_the_features_of_its_own_install() {
+        let t = tempfile::tempdir().unwrap();
+        let (steam, xbox) = (t.path().join("Steam").join("Limitless"), t.path().join("WindowsApps").join("Microsoft.Limitless_1.9.21.0_x64__8wekyb3d8bbwe"));
+        std::fs::create_dir_all(&steam).unwrap();
+        let install = |id: &str, dir: &Path, f: &[&str]| ActiveInstall { id: id.into(), game: "msfs2024".into(), dir: dir.into(), features: f.iter().map(|s| s.to_string()).collect(), settings: Default::default() };
+        let mut s = install("s", &steam, &["trip", "probe"]);
+        s.settings.insert("trip".into(), PathBuf::from("trip/installs/s/settings.json"));
+        let list = ActiveList { features: vec![ActiveFeature { settings: Some("trip/settings.json".into()), ..feature("trip") }, feature("probe")], installs: Some(vec![s, install("x", &xbox, &["probe", "trip"])]), stops: vec![] };
+        let ids = |l: ActiveList| l.features.into_iter().map(|f| f.id).collect::<Vec<_>>();
+        assert_eq!(ids(list.clone().for_exe("msfs2024", &steam.join("FlightSimulator2024.exe"))), ["trip", "probe"]);
+        // The settings file of the install; an install with no entry keeps the feature's file.
+        let settings = |l: ActiveList| l.features.into_iter().find(|f| f.id == "trip").and_then(|f| f.settings);
+        assert_eq!(settings(list.clone().for_exe("msfs2024", &steam.join("x.exe"))), Some(PathBuf::from("trip/installs/s/settings.json")));
+        assert_eq!(settings(list.clone().for_exe("msfs2024", &xbox.join("x.exe"))), Some(PathBuf::from("trip/settings.json")));
+        let list = ActiveList { installs: list.installs.map(|mut v| { v[1].features = vec!["probe".into()]; v }), ..list };
+        assert_eq!(ids(list.clone().for_exe("msfs2024", &xbox.join("FlightSimulator2024.exe"))), ["probe"], "a folder that is not there compares as text");
+        assert!(ids(list.clone().for_exe("msfs2024", &t.path().join("Other").join("FlightSimulator2024.exe"))).is_empty());
+        assert!(ids(list.clone().for_exe("ats", &steam.join("x.exe"))).is_empty(), "another game");
+        let sibling = t.path().join("Steam").join("Limitless2").join("FlightSimulator2024.exe");
+        assert!(ids(list.clone().for_exe("msfs2024", &sibling)).is_empty(), "a folder name that only starts the same");
+        if cfg!(windows) {
+            let upper = PathBuf::from(steam.to_string_lossy().to_uppercase().replace('\\', "/")).join("FlightSimulator2024.exe");
+            assert_eq!(ids(list.clone().for_exe("msfs2024", &upper)).len(), 2, "case and slashes");
+        }
+        let old = ActiveList { installs: None, ..list.clone() };
+        assert_eq!(ids(old.for_exe("msfs2024", &sibling)).len(), 2, "an older app's list stays whole");
+        let json = serde_json::to_value(&ActiveList { installs: None, ..list.clone() }).unwrap();
+        assert!(json.get("installs").is_none(), "no installs key for no installs");
     }
 }

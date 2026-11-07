@@ -1,0 +1,201 @@
+// Feature Machine page SDK, version 2 (feature surfaces plan, section 6). The app serves this file
+// at <page base>_fm/2/page.js; a page links it relative to its own folder. It wraps the fm: 2
+// messages between the page frame and its holder (the app), so old pages that use the messages
+// keep working. It runs inside the sandbox: it is a helper, not a trust boundary.
+// A classic script (module scripts do not load in a sandboxed frame on Windows): it sets window.fm.
+(function () {
+  "use strict";
+  if (window.fm && window.fm.version) return;
+
+  // A beat each second after ready(); the holder unloads a page that misses 3 (section 7).
+  var BEAT_MS = 1000;
+  var parent = window.parent;
+  // No prototype: any topic name ("constructor", "__proto__") is a plain key (Sol r1).
+  var topics = Object.create(null);
+  var state = { sessions: [], settings: {}, schema: [], revision: null, theme: null, application: null, application_name: null };
+  // The newest message of each topic per session ("application:pid"), so a part that a page builds
+  // later (a session block of kit.js) shows the current values at once. A new start of the
+  // feature in a session (another activation) drops the values of the old start.
+  var last = Object.create(null);
+  var starts = Object.create(null);
+  var waits = Object.create(null);
+  var next = 1;
+  var beat = null;
+
+  function post(m) {
+    m.fm = 2;
+    parent.postMessage(m, "*");
+  }
+
+  // Each listener runs on its own: an error in one does not stop the others.
+  function fire(name, args) {
+    (topics[name] || []).slice().forEach(function (fn) {
+      try {
+        fn.apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    });
+  }
+
+  function copy(v) {
+    return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+  }
+
+  // The theme of the app as CSS variables on the page root (--fm-bg, --fm-text, ...); kit.css
+  // uses them, and a page can too.
+  function applyTheme(t) {
+    var root = document.documentElement;
+    root.style.colorScheme = t.scheme === "light" ? "light" : "dark";
+    Object.keys(t.colors || {}).forEach(function (k) {
+      if (/^[a-z0-9-]{1,32}$/.test(k) && typeof t.colors[k] === "string") root.style.setProperty("--fm-" + k, t.colors[k]);
+    });
+  }
+
+  function key(s) {
+    return s.application + ":" + s.pid;
+  }
+
+  // Keeps the newest messages of the sessions that still exist and of their current start only.
+  function keepLast(sessions) {
+    var now = Object.create(null);
+    sessions.forEach(function (s) {
+      var k = key(s);
+      var start = s.feature ? String(s.instance) + "/" + String(s.feature.activation) : null;
+      if (start !== null && starts[k] !== undefined && starts[k] !== start) delete last[k];
+      if (start !== null) starts[k] = start;
+      now[k] = true;
+    });
+    Object.keys(last).forEach(function (k) {
+      if (!now[k]) delete last[k];
+    });
+    Object.keys(starts).forEach(function (k) {
+      if (!now[k]) delete starts[k];
+    });
+  }
+
+  window.addEventListener("message", function (e) {
+    var m = e.data;
+    if (e.source !== parent || !m || m.fm !== 2) return;
+    switch (m.kind) {
+      case "sessions":
+        state.sessions = Array.isArray(m.sessions) ? m.sessions : [];
+        keepLast(state.sessions);
+        fire("fm:sessions", [copy(state.sessions)]);
+        break;
+      case "message":
+        // "fm:" topics are the app's events: a feature message never fires them.
+        if (typeof m.topic === "string" && m.topic.indexOf("fm:") !== 0) {
+          var k = key(m);
+          (last[k] = last[k] || Object.create(null))[m.topic] = m.data;
+          fire(m.topic, [m.data, { application: m.application, pid: m.pid }]);
+        }
+        break;
+      case "schema":
+        state.schema = Array.isArray(m.settings) ? m.settings : [];
+        fire("fm:schema", [copy(state.schema)]);
+        break;
+      case "settings":
+        state.settings = m.values && typeof m.values === "object" ? m.values : {};
+        state.revision = typeof m.revision === "number" ? m.revision : null;
+        fire("fm:settings", [copy(state.settings)]);
+        break;
+      case "setting_result": {
+        var w = waits[m.req];
+        if (!w) break;
+        delete waits[m.req];
+        if (m.error) w.reject(new Error(String(m.error)));
+        else w.resolve();
+        break;
+      }
+      case "context":
+        // The application of the page's home: the app sends only its sessions, so a
+        // page can show the right words and behavior for it. Null: the page has no home.
+        state.application = typeof m.application === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(m.application) ? m.application : null;
+        state.application_name = state.application && typeof m.application_name === "string" ? m.application_name : null;
+        fire("fm:context", [{ application: state.application, application_name: state.application_name }]);
+        break;
+      case "theme":
+        if (m.theme && typeof m.theme === "object") {
+          state.theme = m.theme;
+          applyTheme(m.theme);
+          fire("fm:theme", [copy(m.theme)]);
+        }
+        break;
+      case "send_failed":
+        fire("fm:send_failed", [{ topic: m.topic, error: m.error }]);
+        break;
+    }
+  });
+
+  window.fm = {
+    version: 2,
+    // A message topic of the feature, or an app event: "fm:context", "fm:sessions", "fm:settings",
+    // "fm:schema", "fm:theme", "fm:send_failed" (feature topics never start with "fm:"). Gives a
+    // stop function.
+    on: function (topic, fn) {
+      (topics[topic] = topics[topic] || []).push(fn);
+      return function () {
+        topics[topic] = (topics[topic] || []).filter(function (f) {
+          return f !== fn;
+        });
+      };
+    },
+    // A message to the feature in the application: to one session ({ application, pid }) or to each session.
+    send: function (topic, data, session) {
+      var m = { kind: "send", topic: String(topic), data: data === undefined ? null : data };
+      if (session) {
+        m.application = session.application;
+        m.pid = session.pid;
+      }
+      post(m);
+    },
+    sessions: function () {
+      return copy(state.sessions);
+    },
+    // The application id of the page's home ("ats", "msfs2024", ...), or null before the context.
+    application: function () {
+      return state.application;
+    },
+    // The reviewed display name comes from the holder's descriptors, not a second name table.
+    applicationName: function () {
+      return state.application_name;
+    },
+    settings: function () {
+      return copy(state.settings);
+    },
+    // The settings of feature.json for the version of this page (id, label, type, options, ...).
+    schema: function () {
+      return copy(state.schema);
+    },
+    // The newest data of `topic` from one session ({ application, pid }) of the current start, or
+    // undefined.
+    last: function (topic, session) {
+      var t = session ? last[key(session)] : undefined;
+      return t ? copy(t[topic]) : undefined;
+    },
+    // Writes one setting of the feature through the app (the same check as Manage). The promise
+    // ends when the app stored it; the new values come with "fm:settings".
+    setSetting: function (id, value) {
+      var req = next++;
+      return new Promise(function (resolve, reject) {
+        waits[req] = { resolve: resolve, reject: reject };
+        post({ kind: "set_setting", req: req, id: String(id), value: value });
+      });
+    },
+    get theme() {
+      return copy(state.theme);
+    },
+    // The page is ready: the app then expects a beat each second and unloads a page that stops.
+    ready: function () {
+      post({ kind: "ready" });
+      if (beat === null) {
+        beat = setInterval(function () {
+          post({ kind: "beat" });
+        }, BEAT_MS);
+      }
+    },
+  };
+})();

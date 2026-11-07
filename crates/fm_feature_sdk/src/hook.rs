@@ -35,7 +35,7 @@ impl Event {
             ("installed", None, None) => Ok(Event::Installed),
             ("updated", Some(v), None) => Ok(Event::Updated { from_version: v.into() }),
             ("uninstalling", None, None) => Ok(Event::Uninstalling),
-            ("game-exited", None, Some(g)) => Ok(Event::GameExited { game: g.into() }),
+            ("game-exited" | "application-exited", None, Some(g)) => Ok(Event::GameExited { game: g.into() }),
             _ => Err(format!("bad event {name:?} (updated needs --from-version, game-exited needs --game, others neither)")),
         }
     }
@@ -97,7 +97,7 @@ pub fn user_file_arg(f: &crate::UserFile) -> String {
 
 /// The declared file of a helper argument (user_file_arg), checked with the manifest rules.
 pub fn parse_user_file(arg: &str) -> Result<crate::UserFile, String> {
-    let bad = || format!("bad --user-file {arg:?} (\"read|write:<game>:<path>\")");
+    let bad = || format!("bad --user-file {arg:?} (\"read|write:<application>:<path>\")");
     let (access, rest) = arg.split_once(':').ok_or_else(bad)?;
     let (game, path) = rest.split_once(':').ok_or_else(bad)?;
     let access = match access { "read" => crate::Access::Read, "write" => crate::Access::Write, _ => return Err(bad()) };
@@ -117,7 +117,7 @@ pub fn user_root_arg(game: &str, root: &str) -> String {
 pub fn parse_user_root(arg: &str) -> Result<(String, std::path::PathBuf), String> {
     match arg.split_once(':') {
         Some((game, path)) if crate::files::has_user_folder(game) && !path.is_empty() => Ok((game.into(), path.into())),
-        _ => Err(format!("bad --user-root {arg:?} (\"<game>:<folder>\" for a game with a user folder)")),
+        _ => Err(format!("bad --user-root {arg:?} (\"<application>:<folder>\" for an application with a user folder)")),
     }
 }
 
@@ -299,7 +299,7 @@ unsafe extern "C" fn game_running_cb(ctx: *mut std::ffi::c_void, game: *const u8
         match (c.services.game_running)(game) {
             Ok(r) => r as i32,
             Err(e) => {
-                line(c, &format!("game running {game:?}: {e}"));
+                line(c, &format!("application running {game:?}: {e}"));
                 abi::FAILED
             }
         }
@@ -348,7 +348,7 @@ mod tests {
         assert!(lines.contains(&"write: Ok(()), other: Err(Refused)".to_string()), "{lines:?}");
         assert!(lines.contains(&"on the way: Ok((None, 0, None))".to_string()), "review r2 B2: {lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("user file: \"ats:game.log.txt\" is not declared")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.starts_with("game running \"msfs2024\": no process list")));
+        assert!(lines.iter().any(|l| l.starts_with("application running \"msfs2024\": no process list")));
         assert_eq!(std::fs::read_to_string(t.path().join("profiles/41/config.cfg")).unwrap(), "uset a \"0.3\"\n");
     }
 

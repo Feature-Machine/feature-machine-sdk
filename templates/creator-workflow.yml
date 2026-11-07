@@ -17,6 +17,6 @@ concurrency:
 
 jobs:
   feature:
-    uses: Feature-Machine/feature-machine-sdk/.github/workflows/feature-machine.yml@v0.2.0
+    uses: Feature-Machine/feature-machine-sdk/.github/workflows/feature-machine.yml@v0.3.0
     with:
       feature-dir: "."

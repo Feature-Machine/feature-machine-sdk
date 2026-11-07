@@ -1,3 +1,4 @@
+mod representation;
 // Install pattern of the desktop app (plan M8): every version in its own folder under
 // <root>/versions, and state.json names the active and the previous one. A new version is
 // unpacked to a staging folder, marked complete, renamed, and only then made active with one
@@ -12,6 +13,9 @@ pub mod package;
 pub mod release;
 pub mod memory;
 pub mod module;
+pub mod notice;
+pub mod policy;
+pub mod signed_set;
 pub mod surfaces;
 pub mod views;
 #[cfg(any(test, feature = "testing"))]

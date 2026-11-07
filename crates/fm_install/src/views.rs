@@ -4,7 +4,7 @@
 // so no creator code or markup reaches the home screen. `parse` is the one check for fm_pack,
 // the install and the app, which gives the parsed views to its UI.
 use crate::feature::Manifest;
-use crate::surfaces::{valid_id, Setting, Widget, WidgetSize, IMAGE_EXTS, WIDGETS};
+use crate::surfaces::{valid_id, Setting, SettingKind, Widget, WidgetSize, IMAGE_EXTS, WIDGETS};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -22,6 +22,8 @@ pub mod limits {
     pub const UNIT: usize = 12;
     pub const POINTER: usize = 256;
     pub const POINTS: u32 = 120;
+    /// The options of a select setting that a choice node shows (segments fit a widget).
+    pub const CHOICES: usize = 4;
 }
 
 /// The parsed views of one widget: a tree per size, and the actions that its nodes name.
@@ -134,7 +136,41 @@ pub enum Node {
         label: String,
         action: String,
     },
+    /// A range setting as a slider (feature refresh plan): the member's value, stored as Manage
+    /// does (Views::sets says which settings a widget may write).
+    Slider {
+        setting: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// A select setting of at most `limits::CHOICES` options as segments, stored as Manage does.
+    Choice {
+        setting: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     Spacer {},
+}
+
+impl Node {
+    fn children(&self) -> &[Node] {
+        match self {
+            Node::Stack { children } | Node::Row { children } => children,
+            _ => &[],
+        }
+    }
+
+    fn sets(&self, setting: &str) -> bool {
+        matches!(self, Node::Slider { setting: s, .. } | Node::Choice { setting: s, .. } if s == setting) || self.children().iter().any(|c| c.sets(setting))
+    }
+}
+
+impl Views {
+    /// True when a view of any size has a slider or choice node of `setting`: the member may
+    /// write that setting from the widget (the app checks the value as Manage does).
+    pub fn sets(&self, setting: &str) -> bool {
+        [&self.small, &self.wide, &self.large].into_iter().flatten().any(|n| n.sets(setting))
+    }
 }
 
 /// What a widget can do (section 4): `send` a message to the running feature, set `setting` to
@@ -224,7 +260,7 @@ pub fn parse(bytes: &[u8], w: &Widget, m: &Manifest, has_image: &dyn Fn(&str) ->
         check_action(a, m).map_err(|why| fail(format!("action {:?}: {why}", a.id)))?;
     }
     let settings: BTreeMap<&str, &Setting> = m.surfaces.settings.iter().map(|s| (s.id.as_str(), s)).collect();
-    let cx = Cx { actions: &actions, settings: &settings, has_image };
+    let cx = Cx { actions: &actions, settings: &settings, has_image, controls: crate::surfaces::has_controls(m) };
     for size in &w.sizes {
         let root = views.of(*size).expect("checked above");
         let mut count = 0;
@@ -266,6 +302,8 @@ struct Cx<'a> {
     actions: &'a BTreeSet<&'a str>,
     settings: &'a BTreeMap<&'a str, &'a Setting>,
     has_image: &'a dyn Fn(&str) -> bool,
+    /// The min_app of the manifest knows slider and choice nodes (surfaces::CONTROLS_APP).
+    controls: bool,
 }
 
 impl Cx<'_> {
@@ -295,6 +333,8 @@ impl Cx<'_> {
             Node::Image { src, alt } => crate::surfaces::path_in(src, WIDGETS, &IMAGE_EXTS) && (self.has_image)(src) && text_ok(alt, limits::LABEL),
             Node::Toggle { label: l, state, on, off } => text_ok(l, limits::LABEL) && self.source(state)? && self.action(on)? && self.action(off)?,
             Node::Button { label: l, action } => text_ok(l, limits::LABEL) && self.action(action)?,
+            Node::Slider { setting, label: l } => label(l) && self.setting(setting, |k| matches!(k, SettingKind::Range { .. }), "a range setting")?,
+            Node::Choice { setting, label: l } => label(l) && self.setting(setting, |k| matches!(k, SettingKind::Select { options, .. } if options.len() <= limits::CHOICES), "a select setting of at most 4 options")?,
             Node::Spacer {} => true,
         };
         ok.then_some(()).ok_or_else(|| format!("a {} node is out of its limits (text, label, unit, digits 0 to 6, min < max, points 2 to {}, a package image)", kind(n), limits::POINTS))
@@ -305,6 +345,17 @@ impl Cx<'_> {
             (Some(topic), Some(path), None) => Ok(valid_topic(topic) && path.len() <= limits::POINTER && (path.is_empty() || path.starts_with('/'))),
             (None, None, Some(setting)) => self.settings.contains_key(setting.as_str()).then_some(true).ok_or_else(|| format!("no setting {setting:?} in the manifest")),
             _ => Err("a source is a topic with a path, or a setting".into()),
+        }
+    }
+
+    /// The setting of a slider or choice node: in the manifest and of the right kind.
+    fn setting(&self, id: &str, fits: impl Fn(&SettingKind) -> bool, what: &str) -> Result<bool, String> {
+        if !self.controls {
+            return Err(format!("slider and choice nodes need min_app {} or newer", crate::surfaces::CONTROLS_APP));
+        }
+        match self.settings.get(id) {
+            Some(s) if fits(&s.kind) => Ok(true),
+            _ => Err(format!("setting {id:?} must be {what} of the manifest")),
         }
     }
 
@@ -325,6 +376,8 @@ fn kind(n: &Node) -> &'static str {
         Node::Image { .. } => "image",
         Node::Toggle { .. } => "toggle",
         Node::Button { .. } => "button",
+        Node::Slider { .. } => "slider",
+        Node::Choice { .. } => "choice",
         Node::Spacer {} => "spacer",
     }
 }
@@ -351,7 +404,9 @@ pub(crate) mod tests {
                     { "type": "toggle", "label": "Alert", "state": { "setting": "on" }, "on": "alert_on", "off": "alert_off" },
                     { "type": "button", "label": "Reset", "action": "reset" },
                     { "type": "spacer" },
-                    { "type": "button", "label": "Open", "action": "open" }
+                    { "type": "button", "label": "Open", "action": "open" },
+                    { "type": "slider", "setting": "strength", "label": "Strength" },
+                    { "type": "choice", "setting": "mode" }
                 ] }
             ] },
             "actions": [
@@ -390,6 +445,26 @@ pub(crate) mod tests {
         assert_eq!(serde_json::to_value(&views).unwrap(), speed(), "the app gives the UI the same shape");
     }
 
+    /// Feature refresh plan: a widget may write only the settings of its slider and choice
+    /// nodes; a choice shows a select of at most 4 options.
+    #[test]
+    fn slider_and_choice_name_the_settings_a_widget_writes() {
+        let views = run(&speed()).unwrap();
+        assert!(views.sets("strength") && views.sets("mode"));
+        assert!(!views.sets("on") && !views.sets("tint") && !views.sets("missing"), "a toggle node writes through its actions only");
+        let mut m = surfaced();
+        let Some(SettingKind::Select { options, .. }) = m.surfaces.settings.iter_mut().find(|s| s.id == "mode").map(|s| &mut s.kind) else { panic!() };
+        for v in ["a", "b", "c"] {
+            options.push(crate::surfaces::SelectOption { value: v.into(), label: v.into(), info: None });
+        }
+        let five = parse(&serde_json::to_vec(&speed()).unwrap(), &m.surfaces.widgets[0], &m, &|p| p == "widgets/dial.png");
+        assert!(five.unwrap_err().to_string().contains("at most 4 options"));
+        // An app before CONTROLS_APP refuses the nodes, so the manifest must name a newer one.
+        let old = crate::feature::Manifest { min_app: Some(crate::surfaces::MIN_APP.into()), ..surfaced() };
+        let err = parse(&serde_json::to_vec(&speed()).unwrap(), &old.surfaces.widgets[0], &old, &|p| p == "widgets/dial.png").unwrap_err();
+        assert!(err.to_string().contains(crate::surfaces::CONTROLS_APP), "{err}");
+    }
+
     #[test]
     fn closed_shapes() {
         for (at, to) in [
@@ -417,6 +492,10 @@ pub(crate) mod tests {
             ("/1x1/children/0/source", json!({ "setting": "missing" })),
             ("/2x1/children/1/children/0/source", json!({ "setting": "strength" })),
             ("/2x1/children/1/children/3/action", json!("missing")),
+            ("/2x1/children/1/children/6/setting", json!("on")),
+            ("/2x1/children/1/children/6/setting", json!("missing")),
+            ("/2x1/children/1/children/7/setting", json!("strength")),
+            ("/2x1/children/1/children/6/label", json!("")),
             ("/actions/0/value", json!("yes")),
             ("/actions/0/setting", json!("missing")),
             ("/actions/0/value", Value::Null),

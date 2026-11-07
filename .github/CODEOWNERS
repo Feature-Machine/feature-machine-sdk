@@ -1,0 +1,16 @@
+# Owners of the Feature Machine SDK. The main ruleset needs an owner review for each change.
+# The high-risk paths (CONTRIBUTING.md, deep review) are named again, so that a later team can
+# own them on their own: the build and review gate, the install and signature checks, the
+# permission checks, the shader pins, the workflow that creators copy, and the build settings.
+*                                @runshotgun
+/tools/fm_pack/                  @runshotgun
+/crates/fm_install/              @runshotgun
+/crates/fm_feature_sdk/          @runshotgun
+/crates/fm_memory/               @runshotgun
+/crates/fm_render/shaders/       @runshotgun
+/templates/                      @runshotgun
+/.github/                        @runshotgun
+/.gitattributes                  @runshotgun
+/rust-toolchain.toml             @runshotgun
+/Cargo.toml                      @runshotgun
+/Cargo.lock                      @runshotgun

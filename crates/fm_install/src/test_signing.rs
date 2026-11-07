@@ -54,7 +54,7 @@ impl TestKey {
         use crate::module::*;
         let map = setter_map(map_id);
         let pin = crate::feature::MapDependency { id: map_id.into(), version: "1.0.0".into(), sha256: crate::memory::digest(&map) };
-        let m = ModuleManifest { schema: 1, id: id.into(), name: "Test setter maps".into(), version: "1.0.0".into(), kind: Kind::Data, games: vec![fm_platform::Game::Msfs2024],
+        let m = ModuleManifest { schema: 1, id: id.into(), name: "Test setter maps".into(), version: "1.0.0".into(), kind: Kind::Data, games: vec![fm_platform::ApplicationId::MSFS2024],
             provides: vec![Provided { interface: crate::memory::SETTER_V2_CONTRACT.into(), version: "1.0.0".into(), map: pin.clone() }], powers: vec![Power::GameMemoryWrite],
             license: LICENSE.into(), source: Source { repository: "https://example.invalid/modules".into(), commit: "a".repeat(40) }, min_app: None };
         let mut out = std::io::Cursor::new(Vec::new());
@@ -97,7 +97,7 @@ impl TestKey {
         use crate::module::*;
         let map = camera_locator(version, near);
         let pin = crate::feature::MapDependency { id: "cam-locator".into(), version: version.into(), sha256: crate::memory::digest(&map) };
-        let m = ModuleManifest { schema: 1, id: id.into(), name: "Test camera maps".into(), version: version.into(), kind: Kind::Data, games: vec![fm_platform::Game::Msfs2024],
+        let m = ModuleManifest { schema: 1, id: id.into(), name: "Test camera maps".into(), version: version.into(), kind: Kind::Data, games: vec![fm_platform::ApplicationId::MSFS2024],
             provides: vec![Provided { interface: crate::memory::LOCATOR_CONTRACT.into(), version: "1.0.0".into(), map: pin.clone() }], powers: vec![Power::GameMemoryRead],
             license: LICENSE.into(), source: Source { repository: "https://example.invalid/modules".into(), commit: "a".repeat(40) }, min_app: None };
         let mut out = std::io::Cursor::new(Vec::new());

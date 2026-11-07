@@ -25,6 +25,7 @@ pub enum Access {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserFile {
+    #[serde(alias = "application")]
     pub game: String,
     pub path: String,
     pub access: Access,
@@ -76,7 +77,7 @@ pub fn split_key(key: &str) -> Option<(&str, &str)> {
 /// None (a lifecycle hook). Err: the ABI code (BAD_ARGS for a bad key, REFUSED for a file that is
 /// not declared or a write to a read entry) and the reason for the log.
 pub fn check<'a>(list: &[UserFile], scope: Option<&str>, key: &'a str, need: Need) -> Result<(&'a str, &'a str), (i32, String)> {
-    let (game, path) = split_key(key).ok_or_else(|| (crate::abi::BAD_ARGS, format!("{key:?} is not \"<game>:<path>\" with a plain relative path")))?;
+    let (game, path) = split_key(key).ok_or_else(|| (crate::abi::BAD_ARGS, format!("{key:?} is not \"<application>:<path>\" with a plain relative path")))?;
     if scope.is_some_and(|s| s != game) {
         return Err((crate::abi::REFUSED, format!("{key:?}: this host serves {} files only", scope.unwrap_or(""))));
     }
@@ -97,7 +98,7 @@ pub fn check_list(list: &[UserFile], games: &[String]) -> Result<(), String> {
     let mut seen = std::collections::BTreeSet::new();
     for f in list {
         if !games.contains(&f.game) || !has_user_folder(&f.game) {
-            return Err(format!("user_files: {:?} is not a game of this feature with a user folder", f.game));
+            return Err(format!("user_files: {:?} is not an application of this feature with a user folder", f.game));
         }
         if !valid_pattern(&f.path) {
             return Err(format!("user_files: {:?} is not a plain relative path (\"/\" between parts, \"*\" only as a whole part)", f.path));

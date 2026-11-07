@@ -1,0 +1,54 @@
+# Checks the Developer Certificate of Origin sign-off of each commit in a pull request
+# (CONTRIBUTING.md). Each commit needs "Signed-off-by: <author name> <author email>": the name
+# exact, the email in any case, CR and end spaces ignored. A merge commit fails: the port into the
+# source repository (git am) takes plain commits only. Plain git, no third-party action, no
+# secret: only the two commit ids go into the script, as environment values.
+name: Sign-off
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sign-off:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Each commit has the sign-off of its author
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          lower() { tr '[:upper:]' '[:lower:]'; }
+          status=0
+          # Plain assignments, so that a failed git rev-list stops the job (a loop over a failed
+          # command substitution would see an empty list and pass).
+          merges=$(git rev-list --merges "$BASE..$HEAD")
+          commits=$(git rev-list --no-merges "$BASE..$HEAD")
+          for c in $merges; do
+            echo "::error::commit $c is a merge commit. Rebase the pull request on its base branch."
+            status=1
+          done
+          for c in $commits; do
+            name=$(git log -1 --format=%an "$c")
+            email=$(git log -1 --format=%ae "$c" | lower)
+            found=0
+            while IFS= read -r line; do
+              line=$(printf '%s' "$line" | sed -e 's/[[:space:]]*$//')
+              if [ "${line% <*}" = "$name" ] && [ "$(printf '%s' "${line##* <}" | lower)" = "$email>" ]; then found=1; fi
+            done < <(git log -1 --format=%B "$c" | tr -d '\r' | sed -n 's/^[Ss]igned-[Oo]ff-[Bb]y:[[:space:]]*//p')
+            if [ "$found" = 0 ]; then
+              echo "::error::commit $c has no line \"Signed-off-by: $name <$email>\". Use git commit -s."
+              status=1
+            fi
+          done
+          exit $status

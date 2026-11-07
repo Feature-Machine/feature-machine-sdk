@@ -75,8 +75,10 @@ pub enum Capability {
     /// (Feature::control), and only while the game window is in front.
     Controls,
     /// Files in the game's mod or Community folder.
+    #[serde(alias = "application_files")]
     GameFiles,
     /// The game engine commands in the feature's "game_commands" list (version 2, ATS).
+    #[serde(alias = "application_command")]
     GameCommand,
     /// HTTPS GET requests to the hosts in the feature's "network_hosts" list (version 3). The
     /// app does the fetch and checks the host again against the installed manifest.
@@ -105,6 +107,29 @@ pub enum Capability {
     /// enum failed the whole document). It grants nothing.
     #[serde(other)]
     Unknown,
+}
+
+// Persisted v1 powers retain their identity. Both public spellings must compare equally
+// before policy or consent checks, so a format change cannot grant a new power.
+pub fn effective_power(power: &str) -> &str {
+    match power {
+        "application_command" => "game_command",
+        "application_files" => "game_files",
+        "application_memory_read" => "game_memory_read",
+        "application_memory_write" => "game_memory_write",
+        _ => power,
+    }
+}
+
+/// The format 2 spelling of a power. This conversion never changes its effective scope.
+pub fn canonical_power(power: &str) -> &str {
+    match effective_power(power) {
+        "game_command" => "application_command",
+        "game_files" => "application_files",
+        "game_memory_read" => "application_memory_read",
+        "game_memory_write" => "application_memory_write",
+        other => other,
+    }
 }
 
 /// Review result for multiplayer (user decision 12); until the review service exists, the
@@ -506,7 +531,8 @@ pub enum MirageLook { Physical, Strong }
 
 /// Where a feature shader runs (Host::shader_acquire). Final: the presented image with the game
 /// UI. Scene: the game's HDR scene before tone mapping and UI. SceneDepth: the scene with the
-/// depth in fm_depth (capability render_depth).
+/// depth in fm_depth and, from app 0.2.0-preview.10, the surface ids in fm_surface with fm_grass
+/// (capability render_depth).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShaderStage { Final, Scene, SceneDepth }
 
@@ -559,9 +585,14 @@ impl Host {
         api.as_ref().filter(|a| a.api_version == API_VERSION).map(|a| Host { api: *a })
     }
 
-    /// "ats" or "msfs2024".
-    pub fn game(&self) -> &str {
+    /// The stable application ID of this host session.
+    pub fn application(&self) -> &str {
         unsafe { abi::text(self.api.game, self.api.game_len) }.unwrap_or("")
+    }
+
+    /// Compatibility alias for application(). The C ABI retains its published field names.
+    pub fn game(&self) -> &str {
+        self.application()
     }
 
     /// A message for the feature's page in the app (capability ui_app).
@@ -690,6 +721,11 @@ impl Host {
     }
 
     /// When the game process started; None when the host does not know it.
+    pub fn application_started(&self) -> Option<SystemTime> {
+        self.game_started()
+    }
+
+    /// Compatibility name for application_started().
     pub fn game_started(&self) -> Option<SystemTime> {
         (self.api.game_started_us > 0).then(|| UNIX_EPOCH + Duration::from_micros(self.api.game_started_us))
     }
@@ -720,6 +756,35 @@ pub enum Lifecycle<'a> {
     GameExited { game: &'a str },
 }
 
+/// Neutral lifecycle events. The old Lifecycle type remains for existing feature sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationLifecycle<'a> {
+    Installed,
+    Updated { from_version: &'a str },
+    Uninstalling,
+    ApplicationExited { application: &'a str },
+}
+impl<'a> From<Lifecycle<'a>> for ApplicationLifecycle<'a> {
+    fn from(event: Lifecycle<'a>) -> Self {
+        match event {
+            Lifecycle::Installed => Self::Installed,
+            Lifecycle::Updated { from_version } => Self::Updated { from_version },
+            Lifecycle::Uninstalling => Self::Uninstalling,
+            Lifecycle::GameExited { game } => Self::ApplicationExited { application: game },
+        }
+    }
+}
+impl<'a> From<ApplicationLifecycle<'a>> for Lifecycle<'a> {
+    fn from(event: ApplicationLifecycle<'a>) -> Self {
+        match event {
+            ApplicationLifecycle::Installed => Self::Installed,
+            ApplicationLifecycle::Updated { from_version } => Self::Updated { from_version },
+            ApplicationLifecycle::Uninstalling => Self::Uninstalling,
+            ApplicationLifecycle::ApplicationExited { application } => Self::GameExited { game: application },
+        }
+    }
+}
+
 /// What a lifecycle hook gets from Feature Machine: the data folder, a log, the declared game
 /// files (UserFiles) and the game-running check.
 pub struct LifecycleHost {
@@ -738,6 +803,11 @@ impl LifecycleHost {
 
     /// True while a process of `game` ("ats") runs on this computer. A game can start at any
     /// time, so check it just before work on files that the game saves.
+    pub fn application_running(&self, application: &str) -> Result<bool, HostError> {
+        self.game_running(application)
+    }
+
+    /// Compatibility name for application_running().
     pub fn game_running(&self, game: &str) -> Result<bool, HostError> {
         match unsafe { (self.call.game_running)(self.call.ctx, game.as_ptr(), game.len()) } {
             1 => Ok(true),
@@ -763,6 +833,9 @@ impl UserFiles for LifecycleHost {
     }
 }
 
+/// Neutral source name for the unchanged typed event contract.
+pub type ApplicationEvent<'a> = GameEvent<'a>;
+
 /// A feature. The host calls frame on its feature thread (never the game thread), about 20
 /// times a second, and stop once at the end. game_event gets game events with their attributes;
 /// its default gives the id to event ("paused", "started", ...). http gets the answer to each
@@ -772,6 +845,8 @@ pub trait Feature: Sized + 'static {
     fn start(host: Host) -> Self;
     fn frame(&mut self, frame: &Frame);
     fn event(&mut self, _id: &str) {}
+    fn application_event(&mut self, event: &ApplicationEvent) { self.game_event(event); }
+    /// Compatibility callback. The default application_event forwards here for old sources.
     fn game_event(&mut self, event: &GameEvent) {
         self.event(event.id)
     }
@@ -789,6 +864,10 @@ pub trait Feature: Sized + 'static {
     fn stop(&mut self) {}
     /// Err: the reason, which goes to the hook log; Feature Machine goes on (a removal still
     /// removes). Keep it short: the helper ends a hook after 30 s.
+    fn application_lifecycle(event: ApplicationLifecycle, host: &LifecycleHost) -> Result<(), String> {
+        Self::lifecycle(event.into(), host)
+    }
+    /// Compatibility callback. The neutral callback preserves old lifecycle arguments.
     fn lifecycle(_event: Lifecycle, _host: &LifecycleHost) -> Result<(), String> {
         Ok(())
     }
@@ -861,7 +940,7 @@ pub mod glue {
             let Some(value) = Control::from_attrs(&attrs) else { return abi::BAD_ARGS };
             return catch_unwind(AssertUnwindSafe(|| f.control(control, value))).map_or(abi::FAILED, |_| abi::OK);
         }
-        catch_unwind(AssertUnwindSafe(|| f.game_event(&GameEvent { id, attrs }))).map_or(abi::FAILED, |_| abi::OK)
+        catch_unwind(AssertUnwindSafe(|| f.application_event(&ApplicationEvent { id, attrs }))).map_or(abi::FAILED, |_| abi::OK)
     }
 
     unsafe extern "C" fn on_http<F: Feature>(instance: *mut c_void, id: u64, status: i32, body: *const u8, len: usize) -> i32 {
@@ -899,7 +978,7 @@ pub mod glue {
             abi::LIFECYCLE_GAME_EXITED => Lifecycle::GameExited { game },
             _ => return abi::OK,
         };
-        match catch_unwind(AssertUnwindSafe(|| F::lifecycle(event, &host))) {
+        match catch_unwind(AssertUnwindSafe(|| F::application_lifecycle(event.into(), &host))) {
             Ok(Ok(())) => abi::OK,
             Ok(Err(e)) => {
                 host.log(&e);

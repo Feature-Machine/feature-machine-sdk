@@ -2,25 +2,25 @@
 // GetPackagePathByFullName) gives the install folder for the current user with no admin and no
 // WinRT. Only main packages count (not language resource packages of the same family). The EXE
 // inside WindowsApps has no readable version, so the package version is used.
-use crate::games::GameInstall;
+use crate::applications::ApplicationInstall;
 
 #[cfg(windows)]
-pub fn installs() -> Vec<GameInstall> {
-    use crate::games::{Source, CATALOG};
+pub fn installs() -> Vec<ApplicationInstall> {
+    use crate::applications::{Source, CATALOG};
     let mut out = Vec::new();
-    for def in CATALOG {
+    for def in CATALOG.iter() {
         let (Some(family), Some(exe_rel)) = (def.store_family, def.exe_rel) else { continue };
         for full_name in win::packages_by_family(family) {
             let Some(dir) = win::package_path(&full_name) else { continue };
-            out.push(GameInstall {
-                game: def.game,
+            out.push(ApplicationInstall {
+                game: def.application,
                 source: Source::MicrosoftStore,
                 exe: dir.join(exe_rel),
                 install_dir: dir,
                 version: package_version(&full_name).map(str::to_owned),
                 steam_build_id: None,
                 ready: true,
-                running_pid: None,
+                source_key: None, instances: vec![], service: None, error: None, running_pid: None,
             });
         }
     }
@@ -28,7 +28,7 @@ pub fn installs() -> Vec<GameInstall> {
 }
 
 #[cfg(not(windows))]
-pub fn installs() -> Vec<GameInstall> {
+pub fn installs() -> Vec<ApplicationInstall> {
     Vec::new()
 }
 

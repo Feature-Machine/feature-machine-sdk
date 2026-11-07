@@ -13,6 +13,15 @@ pub const API: u32 = 6;
 /// "0.2.0" left out every 0.2.0 Preview). A manifest with one of them must name this version or a
 /// newer one in `min_app`, so an older app never shows the feature without its surfaces.
 pub const MIN_APP: &str = "0.2.0-preview.5";
+/// The first app with the slider and choice widget nodes and the info of a select option (feature
+/// refresh plan 2026-11-04). An older app refuses them at install, so a manifest that uses them
+/// must name this version or a newer one in `min_app`, and the catalog does not offer it there.
+pub const CONTROLS_APP: &str = "0.2.0-preview.7";
+
+/// True when the `min_app` of `m` is CONTROLS_APP or newer.
+pub(crate) fn has_controls(m: &Manifest) -> bool {
+    crate::release::fits_app(Some(CONTROLS_APP), m.min_app.as_deref().unwrap_or("0.0.0"))
+}
 /// Package folders: `art` holds the icon and the banner, `widgets` the views and their images.
 pub const ART: &str = "art";
 pub const WIDGETS: &str = "widgets";
@@ -135,6 +144,9 @@ pub enum SettingKind {
 pub struct SelectOption {
     pub value: String,
     pub label: String,
+    /// One short line for the option (feature refresh plan: the choice cards of a page show it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<String>,
 }
 
 /// The setting shows only while another toggle or select setting has this value.
@@ -200,7 +212,12 @@ pub fn check(m: &Manifest) -> io::Result<()> {
         return Err(bad(format!("{id}: the banner must be a .webp, .png or .jpg file in {ART}/")));
     }
     check_widgets(id, &s.widgets)?;
-    check_settings(id, &s.settings)
+    check_settings(id, &s.settings)?;
+    let info = s.settings.iter().any(|x| matches!(&x.kind, SettingKind::Select { options, .. } if options.iter().any(|o| o.info.is_some())));
+    if info && !has_controls(m) {
+        return Err(bad(format!("{id}: the info of a select option needs min_app {CONTROLS_APP} or newer")));
+    }
+    Ok(())
 }
 
 fn check_widgets(id: &str, widgets: &[Widget]) -> io::Result<()> {
@@ -268,9 +285,9 @@ fn check_kind(kind: &SettingKind) -> Result<(), &'static str> {
         }
         SettingKind::Select { options, default } => {
             let mut values = std::collections::BTreeSet::new();
-            let each = options.iter().all(|o| (1..=64).contains(&o.value.len()) && shown(&o.label, 60) && values.insert(o.value.as_str()));
+            let each = options.iter().all(|o| (1..=64).contains(&o.value.len()) && shown(&o.label, 60) && o.info.as_deref().is_none_or(|i| shown(i, 200)) && values.insert(o.value.as_str()));
             let ok = (1..=limits::OPTIONS).contains(&options.len()) && each && values.contains(default.as_str());
-            ok.then_some(()).ok_or("a select needs 1 to 64 options with unique values (1 to 64 bytes) and labels, and a default that is one of the values")
+            ok.then_some(()).ok_or("a select needs 1 to 64 options with unique values (1 to 64 bytes), labels and an info of 1 to 200 characters when it has one, and a default that is one of the values")
         }
         SettingKind::Text { default } => (default.len() <= limits::TEXT && !default.chars().any(char::is_control)).then_some(()).ok_or("a text default has at most 256 bytes and no control character"),
         SettingKind::Color { default } => color(default).then_some(()).ok_or("a color default is #rrggbb"),
@@ -498,7 +515,8 @@ pub(crate) mod tests {
                 { "id": "tint", "type": "color", "label": "Tint", "default": "#ff8800", "visible_if": { "setting": "mode", "equals": "night" } }
             ]
         });
-        Manifest { api: FEATURE_API, min_app: Some(MIN_APP.into()), ui: None, surfaces: serde_json::from_value(json).unwrap(), ..crate::feature::tests::manifest() }
+        // CONTROLS_APP: views::tests::speed() has a slider and a choice.
+        Manifest { api: FEATURE_API, min_app: Some(CONTROLS_APP.into()), ui: None, surfaces: serde_json::from_value(json).unwrap(), ..crate::feature::tests::manifest() }
     }
 
     fn files(m: &Manifest) -> Vec<(String, Vec<u8>)> {
@@ -640,7 +658,15 @@ pub(crate) mod tests {
         };
         use serde_json::json;
         one(json!({ "id": "a", "type": "toggle", "label": "A", "default": false })).unwrap();
+        // An option can have one info line (feature refresh plan: the choice cards of a page),
+        // from the first app that knows it.
+        one(json!({ "id": "a", "type": "select", "label": "A", "options": [{ "value": "x", "label": "X", "info": "A thin band." }], "default": "x" })).unwrap();
+        let s: Setting = serde_json::from_value(json!({ "id": "a", "type": "select", "label": "A", "options": [{ "value": "x", "label": "X", "info": "A thin band." }], "default": "x" })).unwrap();
+        let old = Manifest { min_app: Some(MIN_APP.into()), surfaces: Surfaces { settings: vec![s], ..m.surfaces.clone() }, ..m.clone() };
+        assert!(old.check().unwrap_err().to_string().contains(CONTROLS_APP));
         for bad in [
+            json!({ "id": "a", "type": "select", "label": "A", "options": [{ "value": "x", "label": "X", "info": "" }], "default": "x" }),
+            json!({ "id": "a", "type": "select", "label": "A", "options": [{ "value": "x", "label": "X", "info": "i".repeat(201) }], "default": "x" }),
             json!({ "id": "A", "type": "toggle", "label": "A", "default": false }),
             json!({ "id": "a", "type": "toggle", "label": "", "default": false }),
             json!({ "id": "a", "type": "range", "label": "A", "min": 1, "max": 0, "step": 0.1, "default": 0.5 }),

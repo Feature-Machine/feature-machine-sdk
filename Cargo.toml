@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/fm_application",
     "crates/fm_feature_sdk",
     "crates/fm_input",
     "crates/fm_install",
@@ -15,6 +16,7 @@ members = [
 [workspace.dependencies]
 dirs = "6"
 dunce = "1.0.5"
+fm_application = { path = "crates/fm_application" }
 fm_feature_sdk = { path = "crates/fm_feature_sdk" }
 fm_input = { path = "crates/fm_input" }
 fm_install = { path = "crates/fm_install" }

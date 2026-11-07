@@ -41,6 +41,13 @@ pub fn path(features_dir: &Path, id: &str) -> PathBuf {
     features_dir.join(id).join(FILE)
 }
 
+/// The settings file of feature `id` in one game install (per-install setup, app plan
+/// 2026-11-03): <features dir>/<id>/installs/<install id>/settings.json. In the feature folder,
+/// so a removal of the feature removes it too. `install` is an app install id (no separators).
+pub fn install_path(features_dir: &Path, id: &str, install: &str) -> PathBuf {
+    features_dir.join(id).join("installs").join(install).join(FILE)
+}
+
 impl SettingsFile {
     /// A missing file is no settings (revision 0); a damaged or too large one is an error that
     /// the host logs, and the feature starts with no values (it uses its own defaults).

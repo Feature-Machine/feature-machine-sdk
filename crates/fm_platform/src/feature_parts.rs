@@ -4,7 +4,7 @@
 // changed since. A file of the same name from someone else stops the install. The caller makes
 // sure that the game does not run, because a running game holds its files open.
 use crate::game_files::{physical, sha256_file, Kept, Record, Records};
-use crate::{Game, Source};
+use crate::{ApplicationId, ApplicationInstall, Source};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,7 @@ pub fn ats_mod_dir() -> Option<PathBuf> {
 pub fn msfs_user_cfg(source: Source) -> Option<PathBuf> {
     match source {
         Source::Steam => dirs::config_dir().map(|d| d.join("Microsoft Flight Simulator 2024").join("UserCfg.opt")),
+        Source::WindowsUninstall => None,
         Source::MicrosoftStore => dirs::data_local_dir().map(|d| d.join("Packages").join("Microsoft.Limitless_8wekyb3d8bbwe").join("LocalCache").join("UserCfg.opt")),
     }
 }
@@ -41,9 +42,42 @@ pub fn msfs_community_dir(source: Source) -> Option<PathBuf> {
 /// One part to copy: every file under `from` goes to the same relative path under `to`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Part {
-    pub game: Game,
+    pub game: ApplicationId,
     pub from: PathBuf,
     pub to: PathBuf,
+}
+
+/// Reviewed resolvers own application folder semantics. The watcher calls this projection on
+/// its existing writer thread, so adding a descriptor never adds a second file writer.
+pub fn parts_for(dir: &Path, installs: &[ApplicationInstall]) -> Vec<Part> {
+    parts_with(dir, installs, &msfs_community_dir)
+}
+
+type Root = fn(Source, &dyn Fn(Source) -> Option<PathBuf>) -> Option<PathBuf>;
+struct Resolver { id: &'static str, part: Option<&'static str>, root: Root }
+const RESOLVERS: &[Resolver] = &[
+    Resolver { id: "ats_mod", part: Some("ats-mod"), root: |_, _| ats_mod_dir() },
+    Resolver { id: "ats_user", part: None, root: |_, _| ats_mod_dir().and_then(|p| p.parent().map(Path::to_path_buf)) },
+    Resolver { id: "msfs_community", part: Some("msfs-community"), root: |source, community| community(source) },
+];
+
+/// The injected Community resolver permits real-folder regression tests without touching
+/// member folders. Physical grouping retains one owner when two installs share a junction.
+pub fn parts_with(dir: &Path, installs: &[ApplicationInstall], community: &dyn Fn(Source) -> Option<PathBuf>) -> Vec<Part> {
+    let mut parts: Vec<Part> = Vec::new();
+    for install in installs {
+        let Some(definition) = install.game.definition() else { continue };
+        for resolver in RESOLVERS.iter().filter(|r| definition.root_resolvers.iter().any(|id| id == r.id)) {
+            let Some(part) = resolver.part else { continue };
+            let from = dir.join(part);
+            if !from.is_dir() { continue; }
+            let Some(to) = (resolver.root)(install.source, community) else { continue };
+            if !parts.iter().any(|p| physical(&p.to) == physical(&to)) {
+                parts.push(Part { game: install.game, from, to });
+            }
+        }
+    }
+    parts
 }
 
 /// Lists the files under `dir`. file_type does not follow links: a link in a version folder
@@ -152,6 +186,16 @@ mod tests {
     use super::*;
     use crate::game_files::link_dir;
 
+    #[test]
+    fn every_declared_root_has_one_reviewed_resolver() {
+        for id in ApplicationId::ALL {
+            for name in &id.definition().unwrap().root_resolvers {
+                assert_eq!(RESOLVERS.iter().filter(|r| r.id == name).count(), 1, "{name}");
+            }
+        }
+        assert!(ApplicationId::DBOX_HAPTISYNC_CENTER.definition().unwrap().root_resolvers.is_empty());
+    }
+
     fn tree(root: &Path, files: &[(&str, &str)]) {
         for (rel, text) in files {
             let p = root.join(rel);
@@ -176,7 +220,7 @@ mod tests {
         tree(&v2, &[("fm-alert/layout.json", "2"), ("fm-alert/html_ui/a.js", "a2")]);
         tree(&community, &[("someone-else/manifest.json", "x")]);
         let mut rec = Records::load(t.path().join("game-files.json")).unwrap();
-        let part = |from: &Path| vec![Part { game: Game::Msfs2024, from: from.into(), to: community.clone() }];
+        let part = |from: &Path| vec![Part { game: ApplicationId::MSFS2024, from: from.into(), to: community.clone() }];
         assert_eq!(install(&mut rec, "speed-alert", &part(&v1), "0.1.0").unwrap().files.len(), 3);
         assert_eq!(std::fs::read_to_string(community.join("fm-alert/html_ui/a.js")).unwrap(), "a");
         // Update: new content, and the file that v2 dropped goes away.
@@ -202,7 +246,7 @@ mod tests {
         tree(&v1, &[("fm-alert/layout.json", "1")]);
         tree(&v2, &[("fm-alert/layout.json", "2"), ("fm-alert/new.txt", "n")]);
         let mut rec = Records::load(t.path().join("game-files.json")).unwrap();
-        let part = |from: &Path| vec![Part { game: Game::Msfs2024, from: from.into(), to: community.clone() }];
+        let part = |from: &Path| vec![Part { game: ApplicationId::MSFS2024, from: from.into(), to: community.clone() }];
         assert!(install(&mut rec, "speed-alert", &part(&v2), "0.1.0").unwrap().kept.is_empty());
         std::fs::write(community.join("fm-alert/new.txt"), "mine").unwrap();
         let back = install(&mut rec, "speed-alert", &part(&v1), "0.1.0").unwrap();
@@ -227,7 +271,7 @@ mod tests {
         link_dir(&store, &community);
         assert_eq!(physical(&store), physical(&community));
         let mut rec = Records::load(t.path().join("game-files.json")).unwrap();
-        let to = |dir: &Path, from: &Path| Part { game: Game::Msfs2024, from: from.into(), to: dir.into() };
+        let to = |dir: &Path, from: &Path| Part { game: ApplicationId::MSFS2024, from: from.into(), to: dir.into() };
         // The older app: one part for each path, so 4 records for 2 files.
         install(&mut rec, "speed-alert", &[to(&community, &v1), to(&store, &v1)], "0.1.0").unwrap();
         assert_eq!(rec.of_feature("speed-alert").len(), 4);
@@ -259,7 +303,7 @@ mod tests {
         assert_eq!(physical(&a), physical(&b));
         assert_eq!(physical(&b.join("fm/x.txt")), physical(&a).join("fm").join("x.txt"));
         let mut rec = Records::load(t.path().join("game-files.json")).unwrap();
-        let to = |dir: &Path, from: &Path| Part { game: Game::Msfs2024, from: from.into(), to: dir.into() };
+        let to = |dir: &Path, from: &Path| Part { game: ApplicationId::MSFS2024, from: from.into(), to: dir.into() };
         install(&mut rec, "f", &[to(&b, &v1)], "0.1.0").unwrap();
         install(&mut rec, "f", &[to(&a, &v2)], "0.1.0").unwrap();
         assert_eq!(std::fs::read_to_string(a.join("fm/x.txt")).unwrap(), "2");
@@ -285,7 +329,7 @@ mod tests {
             link_dir(&store, &community);
             let file = t.path().join("game-files.json");
             let mut rec = Records::load(file.clone()).unwrap();
-            let to = |dir: &Path, from: &Path| Part { game: Game::Msfs2024, from: from.into(), to: dir.into() };
+            let to = |dir: &Path, from: &Path| Part { game: ApplicationId::MSFS2024, from: from.into(), to: dir.into() };
             let (cur, stale) = if via_store { (&store, &community) } else { (&community, &store) };
             let legacy = |rec: &mut Records| {
                 install(rec, "f", &[to(&community, &v1), to(&store, &v1)], "0.1.0").unwrap();
@@ -322,7 +366,7 @@ mod tests {
         tree(&v1, &[("a/manifest.sii", "m"), ("b.scs", "b")]);
         tree(&mods, &[("b.scs", "not ours")]);
         let mut rec = Records::load(t.path().join("game-files.json")).unwrap();
-        let err = install(&mut rec, "speed-alert", &[Part { game: Game::Ats, from: v1, to: mods.clone() }], "0.1.0").unwrap_err();
+        let err = install(&mut rec, "speed-alert", &[Part { game: ApplicationId::ATS, from: v1, to: mods.clone() }], "0.1.0").unwrap_err();
         assert!(err.to_string().contains("did not install"), "{err}");
         assert!(!mods.join("a/manifest.sii").exists(), "nothing copied");
         assert_eq!(std::fs::read_to_string(mods.join("b.scs")).unwrap(), "not ours");

@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "OS layer: app paths, game install detection and the process list"
+description = "OS layer: app paths, application discovery and process observations"
 
 [dependencies]
+fm_application = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
 fm_paths = { workspace = true }
@@ -18,10 +19,15 @@ steamlocate = { workspace = true }
 sysinfo = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+ntapi = "0.4.3"
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_System_Services", "Win32_System_Console", "Win32_System_JobObjects", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 # App install (M8): the Apps entry and link in the registry, the Start menu shortcut through COM.
+# Toasts (notify.rs): the WinRT notification and XML types.
 winreg = "0.56"
-windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell", "UI_Notifications", "Data_Xml_Dom"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

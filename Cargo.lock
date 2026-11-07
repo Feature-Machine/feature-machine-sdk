@@ -291,8 +291,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fm_application"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fm_feature_sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "fm_memory",
@@ -379,8 +387,11 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "dunce",
+ "fm_application",
  "fm_memory",
  "fm_paths",
+ "libc",
+ "ntapi",
  "serde",
  "serde_json",
  "sha2",

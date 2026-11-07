@@ -1,10 +1,10 @@
 [package]
 name = "fm_feature_sdk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Feature API: the C ABI between our in-game hosts and feature libraries, the Rust side for features (feature! macro) and the loader for hosts"
+description = "Feature API: stable C ABI, Rust feature macro and shared host loader"
 
 [dependencies]
 serde = { workspace = true }

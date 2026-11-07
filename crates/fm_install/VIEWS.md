@@ -47,8 +47,10 @@ A node reads its value from one source:
 
 - `{ "topic": "state", "path": "/speed_kt" }`: the newest message of that topic that your feature
   sent with `Host::ui`, and a JSON Pointer (RFC 6901) into its data (`""` is the whole data). The
-  widget shows the game session of its home that connected last. When the feature does not run,
-  the widget shows the last values of the same version, marked "Last seen".
+  widget shows the application session of its home that connected last. When no session runs the feature,
+  the widget shows the last values of the same version. When that session reports the feature
+  as not running (blocked, stopped), the widget shows "Off in this session" and the reason; a
+  failed feature shows "Failed".
 - `{ "setting": "alert" }`: the member's stored value of a setting of `feature.json`. A `value` node of a select setting shows the label of the option.
 
 ## Nodes
@@ -58,7 +60,7 @@ Each node has a `type` and only the fields below. An unknown node or field is re
 | Type | Fields |
 | --- | --- |
 | `stack` | `children` (top to bottom) |
-| `row` | `children` (left to right) |
+| `row` | `children` (left to right). A row of two or more `value` nodes only shows as boxes: the label over a small value. |
 | `text` | `text` (1 to 80 characters), `style`: `title`, `body` or `caption` |
 | `value` | `source`, `label`, `unit` (12 characters), `digits` (0 to 6) |
 | `gauge` | `source`, `min`, `max`, `label`, `unit` |
@@ -67,6 +69,8 @@ Each node has a `type` and only the fields below. An unknown node or field is re
 | `image` | `src` (a package image in `widgets/`), `alt` |
 | `toggle` | `label`, `state` (a source that is true or false), `on` and `off` (action ids) |
 | `button` | `label`, `action` (an action id) |
+| `slider` | `setting` (a range setting), `label`. The member drags it; the app stores the value as Manage does. |
+| `choice` | `setting` (a select setting of at most 4 options), `label`. One segment for each option. |
 | `spacer` | none |
 
 Limits per view tree: 64 nodes, 8 levels. Labels are at most 40 characters. Text always shows as

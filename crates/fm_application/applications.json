@@ -1,0 +1,126 @@
+{
+  "applications": [
+    {
+      "id": "msfs2024",
+      "name": "Microsoft Flight Simulator 2024",
+      "icon": "icon-msfs2024.png",
+      "art": "application-msfs2024.svg",
+      "platforms": [
+        "windows"
+      ],
+      "discovery": [
+        "steam",
+        "microsoft_store"
+      ],
+      "connections": [
+        "in_process"
+      ],
+      "root_resolvers": [
+        "msfs_community"
+      ],
+      "follows_features": true,
+      "renders_view": true,
+      "multiplayer": true,
+      "multiplayer_clients": [],
+      "data_description": "Flight values, position, pause and switch states",
+      "file_description": "Microsoft Flight Simulator 2024 Community folder",
+      "process": {
+        "steam_app_id": 2537590,
+        "store_family": "Microsoft.Limitless_8wekyb3d8bbwe",
+        "executables": {
+          "windows": "FlightSimulator2024.exe"
+        },
+        "tool_args": [
+          "BuildAssetPackages"
+        ]
+      }
+    },
+    {
+      "id": "ats",
+      "name": "American Truck Simulator",
+      "icon": "icon-ats.png",
+      "art": "application-ats.svg",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "discovery": [
+        "steam"
+      ],
+      "connections": [
+        "in_process"
+      ],
+      "root_resolvers": [
+        "ats_mod",
+        "ats_user"
+      ],
+      "follows_features": true,
+      "renders_view": false,
+      "multiplayer": true,
+      "multiplayer_clients": ["truckersmp"],
+      "data_description": "Vehicle speed, heading, position, pause and switch states",
+      "file_description": "American Truck Simulator mod folder",
+      "process": {
+        "steam_app_id": 270880,
+        "store_family": null,
+        "executables": {
+          "windows": "bin/win_x64/amtrucks.exe",
+          "linux": "bin/linux_x64/amtrucks"
+        },
+        "tool_args": []
+      }
+    },
+    {
+      "id": "dbox-haptisync-center",
+      "name": "D-BOX HaptiSync Center",
+      "icon": "icon-dbox-haptisync-center.svg",
+      "art": "application-dbox-haptisync-center.svg",
+      "platforms": [
+        "windows"
+      ],
+      "discovery": [
+        "windows_uninstall"
+      ],
+      "connections": [
+        "external_service"
+      ],
+      "root_resolvers": [],
+      "follows_features": true,
+      "renders_view": false,
+      "multiplayer": false,
+      "multiplayer_clients": [],
+      "data_description": "API health, Motion Engine health and haptics on or off",
+      "file_description": null,
+      "windows_uninstall": {
+        "display_name": "D-BOX HaptiSync Center",
+        "publisher": "D-BOX Technologies Inc.",
+        "executables": [
+          "HaptiSync Center/HaptiSyncCenter.App.exe",
+          "HaptiSyncCenter.App.exe"
+        ],
+        "service": {
+          "name": "DboxHaptiSyncApi",
+          "display_name": "HaptiSync API",
+          "executable": "HaptiSyncApi.WebApi.exe"
+        }
+      }
+    }
+  ],
+  "sources": [
+    {
+      "id": "steam",
+      "name": "Steam",
+      "icon": "steam"
+    },
+    {
+      "id": "microsoft_store",
+      "name": "Xbox",
+      "icon": "xbox"
+    },
+    {
+      "id": "windows_uninstall",
+      "name": "Windows",
+      "icon": "pc"
+    }
+  ]
+}

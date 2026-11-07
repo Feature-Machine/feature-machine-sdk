@@ -1,7 +1,7 @@
 # Feature Machine SDK
 
 Use this repository to make features for Feature Machine. A feature is a Rust library that the
-Feature Machine hosts load in the game.
+Feature Machine hosts load in a reviewed application process or a separate Feature Machine helper.
 
 ## Crates
 
@@ -20,7 +20,7 @@ Feature Machine hosts load in the game.
    crate-type = ["cdylib", "rlib"]
 
    [dependencies]
-   fm_feature_sdk = { git = "https://github.com/Feature-Machine/feature-machine-sdk", tag = "v0.2.0" }
+   fm_feature_sdk = { git = "https://github.com/Feature-Machine/feature-machine-sdk", tag = "v0.3.0" }
    ```
 
 2. Add `feature.json` next to `Cargo.toml`.
@@ -49,3 +49,16 @@ target/release/fm_pack build <your repository> <commit> <feature folder> <output
 ## License
 
 MIT OR Apache-2.0, at your choice (`LICENSE-MIT`, `LICENSE-APACHE`).
+
+## Application packages
+
+New packages use `"format": 2`, `"applications"` and `"application_commands"`.
+Use `application_command`, `application_files`, `application_memory_read` and
+`application_memory_write` for the corresponding powers. Their scope is unchanged.
+Legacy packages remain readable. Only a reviewed integration can run a target.
+
+Use `Host::application`, `application_started`, `LifecycleHost::application_running`,
+`Feature::application_event` and `Feature::application_lifecycle`. The legacy names remain
+source compatible; the C ABI and its numeric event values are unchanged.
+Page SDK v2 is served at `_fm/2/`. It uses `fm.application()`, `fm.applicationName()` and `application` session fields
+with `fm: 2` messages. Existing `_fm/1/` pages keep their exact protocol.

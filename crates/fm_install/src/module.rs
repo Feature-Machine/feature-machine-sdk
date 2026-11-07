@@ -6,7 +6,7 @@
 use crate::feature::{Manifest, MapDependency, Requirement};
 use crate::memory::{self, Signed};
 use crate::Install;
-use fm_platform::Game;
+use fm_platform::ApplicationId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -26,6 +26,9 @@ pub const CATALOG_SIG: &str = "modules/catalog.json.sig";
 /// schema 2 with the signed field `"view": "v2"`, so a legacy catalog never passes as v2.
 pub const V2_CATALOG: &str = "v2/modules/catalog.json";
 pub const V2_CATALOG_SIG: &str = "v2/modules/catalog.json.sig";
+pub const V3_CATALOG: &str = "v3/modules/catalog.json";
+pub const V3_CATALOG_SIG: &str = "v3/modules/catalog.json.sig";
+pub const V3_VIEW: &str = "v3";
 pub const V2_VIEW: &str = "v2";
 const V2_SCHEMA: u32 = 2;
 const SCHEMA: u32 = 1;
@@ -38,9 +41,11 @@ const LIMIT: u64 = 16 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum Power {
     /// Read-only reads of game memory through a camera map (the 6c camera contracts).
+    #[serde(alias = "application_memory_read")]
     GameMemoryRead,
     /// Writes of game memory through a setter map (mirrored-setter-v2): only its symbols, within
     /// their limits and clamps (ground wetness plan).
+    #[serde(alias = "application_memory_write")]
     GameMemoryWrite,
     #[serde(other)]
     Unknown,
@@ -71,14 +76,34 @@ pub struct Source {
     pub commit: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModuleManifest {
     pub schema: u32,
     pub id: String,
     pub name: String,
     pub version: String,
     pub kind: Kind,
-    pub games: Vec<Game>,
+    pub games: Vec<ApplicationId>,
+    pub provides: Vec<Provided>,
+    pub powers: Vec<Power>,
+    pub license: String,
+    pub source: Source,
+    /// The oldest app version that this module runs on (release-admin item 6, crate::release).
+    pub min_app: Option<String>,
+}
+
+// The remote type constructs the public manifest on read, so a new field cannot be omitted.
+// New output has its own format identity; signed package bytes are verified before conversion.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "ModuleManifest")]
+struct ModuleManifestWire {
+    pub schema: u32,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub kind: Kind,
+    #[serde(alias = "applications")]
+    pub games: Vec<ApplicationId>,
     pub provides: Vec<Provided>,
     pub powers: Vec<Power>,
     pub license: String,
@@ -87,6 +112,20 @@ pub struct ModuleManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_app: Option<String>,
 }
+impl Serialize for ModuleManifest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.schema == 1 { return ModuleManifestWire::serialize(self, serializer); }
+        let mut value = ModuleManifestWire::serialize(self, serde_json::value::Serializer).map_err(serde::ser::Error::custom)?;
+        if self.schema == 2 { crate::representation::neutral_manifest(&mut value); }
+        value.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for ModuleManifest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ModuleManifestWire::deserialize(deserializer)
+    }
+}
+
 
 /// A module id: "<namespace>.<name>", each part a feature id. The namespace is the provider
 /// identity that consent shows; an id never changes, so a new provider is a new id.
@@ -97,7 +136,7 @@ pub fn check_module_id(id: &str) -> Result<(), String> {
 }
 
 /// The game id of the hosts ("msfs2024"): the serde name of Game.
-fn game_name(g: &Game) -> String {
+fn game_name(g: &ApplicationId) -> String {
     serde_json::to_value(g).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
 }
 
@@ -119,11 +158,11 @@ impl ModuleManifest {
         check_module_id(&self.id)?;
         crate::check_version(&self.version).map_err(|e| e.to_string())?;
         crate::release::check_min_app(&self.id, self.min_app.as_deref())?;
-        if self.schema != SCHEMA || self.kind != Kind::Data {
+        if !matches!(self.schema, 1 | 2) || self.kind != Kind::Data {
             return Err(format!("{}: this app knows module schema {SCHEMA} of kind data only", self.id));
         }
         if self.name.trim().is_empty() || self.name.len() > 60 || self.games.is_empty() {
-            return Err(format!("{}: a name of 1 to 60 characters and a game are needed", self.id));
+            return Err(format!("{}: a name of 1 to 60 characters and an application are needed", self.id));
         }
         if self.powers.contains(&Power::Unknown) {
             return Err(format!("{} needs a power that this version of Feature Machine does not know", self.id));
@@ -150,7 +189,7 @@ impl ModuleManifest {
         }
         // Consent shows the powers, so they are exactly what the maps do: none missing, none extra.
         if self.powers.iter().copied().collect::<BTreeSet<_>>() != needed {
-            return Err(format!("{}: the powers must be the ones that its maps need (camera maps game_memory_read, setter maps game_memory_write)", self.id));
+            return Err(format!("{}: the powers must be the ones that its maps need (field of view maps application_memory_read, setter maps application_memory_write)", self.id));
         }
         Ok(())
     }
@@ -187,7 +226,7 @@ fn check_map(m: &ModuleManifest, p: &Provided, bytes: &[u8]) -> Result<Signed, S
         return Err(format!("{}: map {} does not have the contract {}", m.id, p.map.id, p.interface));
     }
     if !m.games.iter().any(|g| game_name(g) == map.game()) {
-        return Err(format!("{}: map {} is for another game", m.id, p.map.id));
+        return Err(format!("{}: map {} is for another application", m.id, p.map.id));
     }
     Ok(map)
 }
@@ -305,7 +344,7 @@ impl Catalog {
         crate::package::verify(bytes, signature, key, &c.revision.to_string()).map_err(|e| format!("module catalog: {e}"))?;
         match (c.schema, c.view.as_deref()) {
             (SCHEMA, None) => Ok(c),
-            (V2_SCHEMA, Some(V2_VIEW)) => Ok(c),
+            (V2_SCHEMA, Some(V2_VIEW)) | (3, Some(V3_VIEW)) => Ok(c),
             _ => Err("module catalog: unknown schema".into()),
         }
     }
@@ -585,6 +624,16 @@ impl Drop for Lease {
 #[derive(Clone, Debug)]
 pub struct Root(PathBuf);
 
+// Each signed feed view keeps its own replay state. Ordered transitions carry revocations
+// forward without letting an older app overwrite the newer view's watermark on rollback.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FeedView { Legacy, V2, V3 }
+impl FeedView {
+    fn of(view: Option<&str>) -> Self { match view { Some(V3_VIEW) => Self::V3, Some(V2_VIEW) => Self::V2, _ => Self::Legacy } }
+    fn name(self) -> Option<&'static str> { match self { Self::Legacy => None, Self::V2 => Some(V2_VIEW), Self::V3 => Some(V3_VIEW) } }
+}
+impl From<bool> for FeedView { fn from(v2: bool) -> Self { if v2 { Self::V2 } else { Self::Legacy } } }
+
 impl Root {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self(dir.into())
@@ -686,31 +735,31 @@ impl Root {
 
     /// The cache of the view in use (v2_started).
     fn cache_file(&self) -> PathBuf {
-        self.cache_file_of(self.v2_started())
+        self.cache_file_of(self.current_view())
     }
 
     /// The two watermark copies of the view in use (tests; the code names the view).
     #[cfg(test)]
     fn known_paths(&self) -> [PathBuf; 2] {
-        self.known_paths_of(self.v2_started())
+        self.known_paths_of(self.current_view())
     }
 
     /// The v2 view has its own trust files (client contract item 7), so an app from before the
     /// release rules keeps its legacy cache and watermark after a switch back to it, and its
     /// legacy refresh never changes the v2 state (Sol review r5).
-    fn cache_file_of(&self, v2: bool) -> PathBuf {
-        self.0.join(if v2 { "catalog-v2.json" } else { "catalog.json" })
+    fn cache_file_of(&self, view: impl Into<FeedView>) -> PathBuf {
+        self.0.join(match view.into().name() { Some(view) => format!("catalog-{view}.json"), None => "catalog.json".into() })
     }
 
-    /// The two watermark copies of one view, written in this order.
-    fn known_paths_of(&self, v2: bool) -> [PathBuf; 2] {
-        if v2 { [self.0.join("known-v2-a.json"), self.0.join("known-v2-b.json")] } else { [self.0.join("known-a.json"), self.0.join("known-b.json")] }
+    fn known_paths_of(&self, view: impl Into<FeedView>) -> [PathBuf; 2] {
+        let prefix = view.into().name().map_or("known".into(), |view| format!("known-{view}"));
+        [self.0.join(format!("{prefix}-a.json")), self.0.join(format!("{prefix}-b.json"))]
     }
 
-    /// True when a v2 trust file is there (or does not stat): from then on the v2 files decide,
-    /// and a lost v2 watermark is damage, not a new start from the legacy one.
-    fn v2_started(&self) -> bool {
-        self.known_paths_of(true).iter().chain([&self.cache_file_of(true)]).any(|p| p.try_exists().unwrap_or(true))
+    fn current_view(&self) -> FeedView {
+        [FeedView::V3, FeedView::V2].into_iter().find(|view|
+            self.known_paths_of(*view).iter().chain([&self.cache_file_of(*view)]).any(|p| p.try_exists().unwrap_or(true))
+        ).unwrap_or(FeedView::Legacy)
     }
 
     /// The cache file checked with `key`, and the SHA-256 of its exact catalog bytes.
@@ -741,19 +790,20 @@ impl Root {
     fn established(&self) -> bool {
         let has = |p: PathBuf| std::fs::read_dir(p).map_or_else(|e| e.kind() != std::io::ErrorKind::NotFound, |mut d| d.next().is_some());
         // try_exists: a file that does not stat counts as state too (Sol r7 sweep).
-        let trust = [false, true].map(|v2| self.known_paths_of(v2).into_iter().chain([self.cache_file_of(v2)])).into_iter().flatten();
+        let trust = [FeedView::Legacy, FeedView::V2, FeedView::V3].map(|v2| self.known_paths_of(v2).into_iter().chain([self.cache_file_of(v2)])).into_iter().flatten();
         trust.chain([self.pointer_file()]).any(|p| p.try_exists().unwrap_or(true)) || has(self.0.join("locks")) || has(self.0.join("store"))
     }
 
     /// The trust state (Trust) of the view in use.
     fn trust(&self) -> Trust {
-        self.trust_of(self.v2_started())
+        self.trust_of(self.current_view())
     }
 
     /// The trust state of one view. A copy that does not read or parse is damaged, never missing:
     /// with no valid copy, established state is Damaged (Sol r2 R2-1). Valid copies merge: the
     /// highest revision with its digest, and the revocations of both.
-    fn trust_of(&self, v2: bool) -> Trust {
+    fn trust_of(&self, view: impl Into<FeedView>) -> Trust {
+        let v2 = view.into();
         let (mut best, mut bad): (Option<Known>, Vec<String>) = (None, vec![]);
         for p in self.known_paths_of(v2) {
             let k = match std::fs::read(&p) {
@@ -839,7 +889,7 @@ impl Root {
     fn write_known(&self, w: &Writer, k: &Known) -> Result<(), String> {
         self.owns(w)?;
         let bytes = serde_json::to_vec_pretty(k).map_err(|e| e.to_string())?;
-        for p in self.known_paths_of(k.view.is_some()) {
+        for p in self.known_paths_of(FeedView::of(k.view.as_deref())) {
             if std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Known>(&b).ok()).as_ref() != Some(k) {
                 fm_platform::files::write_replace(&p, &bytes).map_err(|e| format!("module catalog watermark {}", at(&p, e)))?;
             }
@@ -857,18 +907,18 @@ impl Root {
         let new = Catalog::verify(bytes, signature, key)?;
         let text = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
         let sha256 = memory::digest(bytes);
-        let (v2, started) = (new.is_v2(), self.v2_started());
-        if !v2 && started {
-            return Err("a legacy module catalog after the v2 catalog is refused".into());
+        let (view, current) = (FeedView::of(new.view.as_deref()), self.current_view());
+        if view < current || (view < FeedView::V3 && !self.lock_revisions(Some(V3_VIEW))?.is_empty()) {
+            if current == FeedView::V2 && view == FeedView::Legacy { return Err("a legacy module catalog after the v2 catalog is refused".into()); }
+            return Err("an older module catalog view after a newer view is refused".into());
         }
-        // The first v2 catalog starts the v2 files from the legacy trust (item 7).
-        let first_v2 = v2 && !started;
-        let (mut revoked, accepted, seen) = match self.trust_of(v2 && started) {
+        let first_view = view > current;
+        let (mut revoked, accepted, seen) = match self.trust_of(if first_view { current } else { view }) {
             Trust::New => (vec![], Accepted::Newer, 0),
             // Its revisions count apart, so it starts a new watermark with the revocations
             // received so far. A v2 lock file is still a floor: deleted v2 files are no new start.
-            Trust::Known(k) if first_v2 => {
-                if let Some(f) = self.lock_revisions(Some(V2_VIEW))?.into_iter().max().filter(|f| new.revision < *f) {
+            Trust::Known(k) if first_view => {
+                if let Some(f) = self.lock_revisions(new.view.as_deref())?.into_iter().max().filter(|f| new.revision < *f) {
                     return Err(format!("module catalog revision {} is older than revision {f} that a kept session lock records (refused as a replay)", new.revision));
                 }
                 (k.revoked, Accepted::Newer, k.feed_time)
@@ -892,7 +942,7 @@ impl Root {
         self.write_known(w, &Known { revision: new.revision, sha256, revoked, feed_time, view: new.view.clone() })?;
         if accepted != Accepted::Same || !matches!(self.cached_catalog(key), Ok(Some(_))) {
             let cached = serde_json::to_vec(&Cached { catalog: text, signature: signature.trim().to_string() }).map_err(|e| e.to_string())?;
-            let file = self.cache_file_of(v2);
+            let file = self.cache_file_of(view);
             fm_platform::files::write_replace(&file, &cached).map_err(|e| format!("module catalog cache {}", at(&file, e)))?;
         }
         Ok((new, accepted))
@@ -952,7 +1002,7 @@ impl Root {
             match file.try_lock_shared() {
                 Ok(()) => return Ok(Some(file)),
                 Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < end => std::thread::sleep(std::time::Duration::from_millis(20)),
-                Err(std::fs::TryLockError::WouldBlock) => return Err("the module files stay busy (Feature Machine changes them); start the game again".into()),
+                Err(std::fs::TryLockError::WouldBlock) => return Err("the module files stay busy (Feature Machine changes them); start a new application session".into()),
                 Err(std::fs::TryLockError::Error(e)) => return Err(format!("module files {}", at(&path, e))),
             }
         }
@@ -1235,7 +1285,7 @@ impl Rules<'_> {
 
 /// The module version of `m` that gives requirement `r` for a game of the feature: the
 /// interface and map in range.
-fn fits(m: &ModuleManifest, r: &Requirement, games: &[Game]) -> Option<Provided> {
+fn fits(m: &ModuleManifest, r: &Requirement, games: &[ApplicationId]) -> Option<Provided> {
     let range = semver::VersionReq::parse(&r.versions).ok()?;
     let game = m.games.iter().any(|g| games.contains(g));
     m.provides.iter().find(|p| p.interface == r.interface && p.map.id == r.map && semver::Version::parse(&p.version).is_ok_and(|v| range.matches(&v)) && game).cloned()
@@ -1565,7 +1615,7 @@ impl Session {
         let locked = lock.and_then(|l| l.feature(&m.id)).filter(|f| f.version == m.version && f.sha256 == stamp);
         let (Some(lock), Some(locked)) = (lock, locked) else {
             if !m.requires.is_empty() {
-                return Err(format!("{} {}: not in the session lock; it starts at the next game start after Feature Machine prepares its modules", m.id, m.version));
+                return Err(format!("{} {}: not in the session lock; it starts at the next application session after Feature Machine prepares its modules", m.id, m.version));
             }
             if m.memory_maps.is_empty() { return Ok(vec![]); }
             return memory::verify_directory(dir, m).map(|maps| m.memory_maps.iter().cloned().zip(maps).collect());
@@ -1622,7 +1672,7 @@ impl Session {
         if std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?.len() > LIMIT { return Err("module map exceeds the size limit".into()); }
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let map = check_map(&manifest, &provided, &bytes)?;
-        if !m.games.iter().any(|g| game_name(g) == map.game()) { return Err(format!("{}: map {} is for another game", m.id, r.map)); }
+        if !m.games.iter().any(|g| game_name(g) == map.game()) { return Err(format!("{}: map {} is for another application", m.id, r.map)); }
         Ok((provided.map, map))
     }
 }
@@ -2350,6 +2400,9 @@ mod tests {
         assert!(w.consent.covers(&w.entries[1].0.manifest), "a new version with the same powers: no question");
         let wider = ModuleManifest { powers: vec![Power::GameMemoryRead, Power::Unknown], ..m.clone() };
         assert!(!w.consent.covers(&wider) && !w.consent.is_new(&wider), "a new power asks again");
+        // Partial approval (Sol slice 11 r3): only the added power is new, the approved read is not.
+        let writer = ModuleManifest { powers: vec![Power::GameMemoryRead, Power::GameMemoryWrite], ..m.clone() };
+        assert_eq!(w.consent.new_powers(&writer), [Power::GameMemoryWrite]);
         let other = ModuleManifest { id: "someone.test-camera".into(), ..m.clone() };
         assert!(w.consent.is_new(&other), "another provider is a new identity");
         // With consent for 1.0.0 only by identity, 1.1.0 (same powers) is selected too.
@@ -2964,5 +3017,28 @@ mod tests {
         assert!(w.maps(&mirage).unwrap_err().contains(&w.dir("0.3.0").join(crate::PACKAGE_STAMP).display().to_string()), "the path (R8-3)");
         drop(held);
         assert!(w.maps(&mirage).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod application_view_tests {
+    use super::*;
+    #[test]
+    fn v3_has_separate_trust_and_cannot_accept_a_replayed_old_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::new(temp.path());
+        let key = crate::test_signing::TestKey::default();
+        let writer = root.writer().unwrap();
+        for (schema, view, revision) in [(2, "v2", 4), (3, "v3", 1)] {
+            let c = Catalog { schema, view:Some(view.into()), revision, issued:1, expires:u64::MAX, modules:vec![], revoked:vec![] };
+            let bytes = serde_json::to_vec(&c).unwrap();
+            root.accept_catalog(&writer, &bytes, &key.sign(&bytes, &revision.to_string()), &key.public(), None).unwrap();
+        }
+        assert!(root.path().join("known-v2-a.json").is_file());
+        assert!(root.path().join("known-v3-a.json").is_file());
+        let c = Catalog { schema:2, view:Some("v2".into()), revision:5, issued:1, expires:u64::MAX, modules:vec![], revoked:vec![] };
+        let bytes = serde_json::to_vec(&c).unwrap();
+        assert!(root.accept_catalog(&writer, &bytes, &key.sign(&bytes, "5"), &key.public(), None).is_err());
+        assert_eq!(root.cached_catalog(&key.public()).unwrap().unwrap().view.as_deref(), Some("v3"));
     }
 }

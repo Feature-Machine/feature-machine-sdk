@@ -12,6 +12,8 @@ pub const USAGE: &str = "fm_pack module <dir> <out.zip> | fm_pack module-verify 
 
 /// The v2 catalog: schema 2 with the signed field "view": "v2". So the legacy catalog can never
 /// be replayed at the v2 path, nor this one at the legacy path (apps 0.1.x take schema 1 only).
+pub const V3_CATALOG: &str = "v3/modules/catalog.json";
+pub const V3_CATALOG_SIG: &str = "v3/modules/catalog.json.sig";
 pub const V2_CATALOG: &str = "v2/modules/catalog.json";
 pub const V2_CATALOG_SIG: &str = "v2/modules/catalog.json.sig";
 const V2_SCHEMA: u32 = 2;
@@ -33,6 +35,7 @@ pub fn command(args: &[&str]) -> Result<(), String> {
         ["module", dir, out] => pack(dir, out),
         ["module-verify", feed] => verify(feed, crate::feed::key()),
         ["module-verify-v2", feed] => verify_v2(feed, crate::feed::key()),
+        ["module-verify-v3", feed] => verify_v3(feed, crate::feed::key()),
         ["module-publish", feed, zip] => publish(feed, zip, crate::feed::key(), Channel::Stable),
         ["module-publish", feed, zip, "preview"] => publish(feed, zip, crate::feed::key(), Channel::Preview),
         ["module-promote", feed, id, version] => change(feed, |c| promote(c, id, version)),
@@ -64,7 +67,7 @@ fn verify(feed: &str, key: &str) -> Result<(), String> {
     let signature = std::fs::read_to_string(&sig).map_err(|e| format!("{}: {e}", sig.display()))?;
     let c = Catalog::verify(&bytes, signature.trim(), key)?;
     // fm_install accepts both views now (item 7); the legacy path takes the legacy view only.
-    if c.is_v2() {
+    if c.view.is_some() {
         return Err("module catalog: a v2 catalog at the legacy path".into());
     }
     println!("module catalog: revision {} signed by the feed key", c.revision);
@@ -96,6 +99,27 @@ fn verify_v2(feed: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_v3(feed: &str, key: &str) -> Result<(), String> {
+    let bytes = std::fs::read(Path::new(feed).join(V3_CATALOG)).map_err(|e| e.to_string())?;
+    let signature = std::fs::read_to_string(Path::new(feed).join(V3_CATALOG_SIG)).map_err(|e| e.to_string())?;
+    let c = Catalog::verify(&bytes, signature.trim(), key)?;
+    if c.view.as_deref() != Some("v3") { return Err("v3 module catalog: not schema 3 with view v3".into()); }
+    Ok(())
+}
+
+fn read_v3(feed: &str) -> Result<Catalog, String> {
+    let file = Path::new(feed).join(V3_CATALOG);
+    match std::fs::read(&file) {
+        Ok(bytes) => {
+            let c: Catalog = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if c.schema != 3 || c.view.as_deref() != Some("v3") { return Err("not schema 3 with view v3".into()); }
+            Ok(c)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Catalog { schema:3, view:Some("v3".into()), revision:0, ..read_v2(feed)? }),
+        Err(e) => Err(format!("{}: {e}", file.display())),
+    }
+}
+
 /// The v2 catalog, or one made from the legacy catalog (all Stable) when the feed has none yet.
 fn read_v2(feed: &str) -> Result<Catalog, String> {
     let file = Path::new(feed).join(V2_CATALOG);
@@ -123,11 +147,9 @@ fn read_v2(feed: &str) -> Result<Catalog, String> {
 /// stale legacy catalog (a revocation missing); the next run of any kind repairs it (code
 /// review r1). A current legacy catalog keeps its bytes.
 pub fn init(feed: &str) -> Result<(), String> {
-    match (Path::new(feed).join(V2_CATALOG).exists(), catalog_file(feed).exists()) {
-        (true, _) => derive_legacy(feed, &read_v2(feed)?),
-        (false, true) => change(feed, |_| Ok(())),
-        (false, false) => Ok(()),
-    }
+    if Path::new(feed).join(V3_CATALOG).exists() { derive_older(feed, &read_v3(feed)?) }
+    else if Path::new(feed).join(V2_CATALOG).exists() || catalog_file(feed).exists() { change(feed, |_| Ok(())) }
+    else { Ok(()) }
 }
 
 fn now() -> u64 {
@@ -146,13 +168,32 @@ fn write_catalog(feed: &str, file: &str, sig: &str, value: &impl serde::Serializ
 /// LEGACY_APP and every revocation. It changes (and loses its signature) only when that content
 /// changes, so a Preview module never gives old apps a new catalog.
 fn change(feed: &str, edit: impl FnOnce(&mut Catalog) -> Result<(), String>) -> Result<(), String> {
-    let mut c = read_v2(feed)?;
+    let mut c = read_v3(feed)?;
     edit(&mut c)?;
     let now = now();
     (c.revision, c.issued, c.expires) = (c.revision + 1, now, now + VALID_SECONDS);
-    write_catalog(feed, V2_CATALOG, V2_CATALOG_SIG, &V2 { c: c.clone(), view: "v2".into() })?;
-    println!("v2 module catalog: revision {} (sign it)", c.revision);
-    derive_legacy(feed, &c)
+    write_catalog(feed, V3_CATALOG, V3_CATALOG_SIG, &c)?;
+    println!("v3 module catalog: revision {} (sign it)", c.revision);
+    derive_older(feed, &c)
+}
+
+// Both old catalogs must stay parseable before their app-version filters run. Keep every
+// revocation, but exclude neutral manifests and targets unknown to their closed enum.
+fn compatible(manifest: &module::ModuleManifest) -> bool {
+    manifest.schema == 1 && manifest.games.iter().all(|id| matches!(*id, fm_platform::ApplicationId::ATS | fm_platform::ApplicationId::MSFS2024))
+}
+
+fn derive_older(feed: &str, source: &Catalog) -> Result<(), String> {
+    let mut v2 = read_v2(feed)?;
+    let modules: Vec<_> = source.modules.iter().filter(|entry| compatible(&entry.manifest)).cloned().collect();
+    if v2.modules != modules || v2.revoked != source.revoked || !Path::new(feed).join(V2_CATALOG).exists() {
+        v2.modules = modules;
+        v2.revoked = source.revoked.clone();
+        (v2.schema, v2.view) = (2, Some("v2".into()));
+        (v2.revision, v2.issued, v2.expires) = (v2.revision + 1, now(), source.expires);
+        write_catalog(feed, V2_CATALOG, V2_CATALOG_SIG, &v2)?;
+    }
+    derive_legacy(feed, &v2)
 }
 
 /// The legacy catalog from the v2 one: Stable entries that fit LEGACY_APP and every revocation.
@@ -160,7 +201,7 @@ fn change(feed: &str, edit: impl FnOnce(&mut Catalog) -> Result<(), String>) -> 
 fn derive_legacy(feed: &str, c: &Catalog) -> Result<(), String> {
     let now = now();
     let mut legacy = read(feed)?;
-    let fits = |e: &&CatalogEntry| e.channel == Channel::Stable && fits_app(e.manifest.min_app.as_deref(), crate::feed::LEGACY_APP);
+    let fits = |e: &&CatalogEntry| compatible(&e.manifest) && e.channel == Channel::Stable && fits_app(e.manifest.min_app.as_deref(), crate::feed::LEGACY_APP);
     let modules: Vec<CatalogEntry> = c.modules.iter().filter(fits).map(|e| CatalogEntry { url: format!("files/{}", crate::feed::file_name(&e.url)), ..e.clone() }).collect();
     if legacy.modules != modules || legacy.revoked != c.revoked || !catalog_file(feed).exists() {
         (legacy.modules, legacy.revoked) = (modules, c.revoked.clone());
@@ -182,7 +223,7 @@ fn publish(feed: &str, zip: &str, key: &str, channel: Channel) -> Result<(), Str
     let name = format!("{}-{}.zip", manifest.id, manifest.version);
     let entry = CatalogEntry { manifest, url: format!("../../modules/files/{name}"), sha256: crate::sha256_hex(&bytes), size: bytes.len() as u64, signature, yanked: false, channel };
     module::verify_package(&bytes, &entry, key).map_err(|e| format!("{sig_file}: {e}"))?;
-    let c = read_v2(feed)?;
+    let c = read_v3(feed)?;
     if let Some(old) = c.entry(&entry.manifest.id, &entry.manifest.version) {
         if old.sha256 != entry.sha256 { return Err(format!("{name} is on the feed with other bytes; a changed module needs a new version")); }
         println!("module: {name} is already on the feed");
@@ -331,7 +372,7 @@ mod tests {
         assert!(!legacy_sig.exists(), "a new legacy catalog loses the old signature");
         assert_eq!((read(&feed).unwrap().revision, listed(&read(&feed).unwrap()).len(), v2().c.revision), (2, 2, 3));
         command(&["module-promote", &feed, "p42.test-camera", "1.1.0"]).unwrap();
-        assert_eq!((listed(&read(&feed).unwrap()).len(), v2().c.revision), (2, 4), "a retried promotion passes");
+        assert_eq!((listed(&read(&feed).unwrap()).len(), v2().c.revision, read_v3(&feed).unwrap().revision), (2, 3, 4), "a retry advances the source and keeps unchanged old views");
         let stale = std::fs::read(catalog_file(&feed)).unwrap();
         command(&["module-revoke", &feed, "p42.test-camera", "1.0.0", "reads the wrong memory"]).unwrap();
         assert_eq!((read(&feed).unwrap().revoked.len(), v2().c.revoked.len()), (1, 1), "a revocation reaches old apps too");

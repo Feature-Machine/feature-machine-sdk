@@ -1,11 +1,11 @@
-// The loader for our in-game hosts (ATS plugin, MSFS host) and the test host. It loads each
-// library of the active list for this game (API 1 to 5, abi.rs change rule), gives each feature
+// The shared loader for in-process, external and test hosts. It loads each
+// library of the active list for this application (API 1 to 6, abi.rs change rule), gives each feature
 // its own HostApi that checks the declared capabilities, and calls the features on one thread.
 // HTTP requests wait here for an answer or the timeout; native value subscriptions are counted
-// here, so a host watches each game name once. No unload. Lifecycle hooks: hook.rs.
+// here, so a host watches each native value name once. No unload. Lifecycle hooks: hook.rs.
 use crate::abi::{self, AbiEvent, AbiFrame, AbiValue, AbiVar, FeatureApi, HostApi};
 pub use crate::active::{FeatureStatus, State};
-use crate::active::{ActiveFeature, ActiveList};
+use crate::active::{ActiveFeature, ActiveList, Apply, PolicyStop};
 use crate::{valid_control_id, Capability, Control, HostError, HttpAnswer, Multiplayer, RenderParams, ShaderStage, Value, Var};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
@@ -60,7 +60,7 @@ pub trait Backend: Send + Sync + 'static {
     fn stopped(&self, feature: &str);
     /// A checked engine command (capability and first word): queue it for the game thread.
     fn game_command(&self, _feature: &str, _text: &str) -> Result<(), String> {
-        Err("this game has no engine commands".into())
+        Err("this application has no engine commands".into())
     }
     /// A checked HTTPS GET (capability, https, declared host) with its request id: send it to
     /// the app, which answers later through FeatureSet::http_answer. Err: no request was sent,
@@ -79,7 +79,7 @@ pub trait Backend: Send + Sync + 'static {
     }
     /// A checked sim event (capability, name): send it once with its data, never reversed.
     fn send_event(&self, _feature: &str, _name: &str, _data: i32) -> Result<(), String> {
-        Err("this game has no sim events; use an input or an engine command".into())
+        Err("this application has no simulation events; use an input or an engine command".into())
     }
     /// Mapped subscriptions use their complete key. Defaults refuse an unimplemented adapter.
     fn memory_watch(&self, _key: &str, _on: bool) -> Result<(), String> { Err("mapped memory is unavailable in this host".into()) }
@@ -107,6 +107,8 @@ pub trait Backend: Send + Sync + 'static {
         crate::files::default_user_root(game).ok_or_else(|| format!("{game} has no user folder in Feature Machine"))
     }
     /// When the game process started (HostApi::game_started_us). None: not known.
+    fn application_started(&self) -> Option<std::time::SystemTime> { self.game_started() }
+    /// Compatibility provider for existing backends.
     fn game_started(&self) -> Option<std::time::SystemTime> { None }
 }
 
@@ -306,8 +308,8 @@ struct Item {
 
 /// Why `open` gave no entry.
 enum Open {
-    /// A blocked feature in multiplayer.
-    Blocked,
+    /// A blocked feature in multiplayer, or a game policy (the state detail).
+    Blocked(String),
     Refused(String),
     Wait(String),
     /// Admitted, then the library did not load: cleanup ran (it can still be pending).
@@ -338,17 +340,31 @@ impl AppMessage {
 
 /// Status detail of a feature whose list version is not its session version (decisions 2 and 5
 /// of the feature session sync plan): it starts at the next game start.
-pub const UPDATE_WAITS: &str = "the update starts at the next game start";
+pub const UPDATE_WAITS: &str = "the update starts at the next application session";
 /// Status detail of a feature that `sync` stopped because the list no longer has it.
 pub const TURNED_OFF: &str = "turned off in the app";
 /// Status detail of a memory or color pass feature that stopped at an app link loss, and the
 /// host's admission text while no app link is live (plan 12.2, "Other host rules").
 pub const APP_LOST: &str = "waits for Feature Machine";
+/// Status detail of a feature with the multiplayer flag "blocked" in a multiplayer session.
+pub const NOT_IN_MULTIPLAYER: &str = "not loaded in multiplayer";
+
+/// Status detail of a feature that a game policy keeps off (PolicyStop): the policy reason.
+pub fn policy_detail(stop: &PolicyStop) -> String {
+    format!("application policy {}: {}", stop.policy, stop.reason)
+}
 
 pub struct FeatureSet {
     items: Vec<Item>,
     backend: Arc<dyn Backend>,
     multiplayer: bool,
+    /// The multiplayer client that the host found (set_multiplayer), for policies that name it.
+    client: Option<String>,
+    /// The game policies of this game from the last list (load_more, sync).
+    stops: Vec<PolicyStop>,
+    /// Each policy that applied in this game session: a lifted policy still refuses a start
+    /// until the next game start, also for a feature that never ran here (Sol r3).
+    applied: Vec<PolicyStop>,
     net: Arc<Mutex<Net>>,
     /// Game id of this set: the prefix of the subscribe keys.
     game: String,
@@ -412,7 +428,7 @@ fn start(meta: &ActiveFeature, activation: u64, game: &str, backend: &Arc<dyn Ba
         settings,
         settings_revision,
     });
-    let game_started_us = backend.game_started().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_micros() as u64);
+    let game_started_us = backend.application_started().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_micros() as u64);
     let host = Box::new(HostApi {
         api_version: entry.api,
         ctx: &*ctx as *const Ctx as *mut c_void,
@@ -480,7 +496,7 @@ fn load_library(meta: &ActiveFeature) -> Result<Entry, String> {
 impl FeatureSet {
     /// An empty set for `game` (tests add features with add).
     pub fn new(game: &str, backend: Arc<dyn Backend>, multiplayer: bool) -> FeatureSet {
-        FeatureSet { items: vec![], backend, multiplayer, net: Default::default(), game: game.to_string(), subs: Default::default(), held: BTreeMap::new(), pins: BTreeMap::new(), instance: new_instance(), last_activation: 0 }
+        FeatureSet { items: vec![], backend, multiplayer, client: None, stops: vec![], applied: vec![], net: Default::default(), game: game.to_string(), subs: Default::default(), held: BTreeMap::new(), pins: BTreeMap::new(), instance: new_instance(), last_activation: 0 }
     }
 
     /// This host instance (Hello.instance).
@@ -535,6 +551,7 @@ impl FeatureSet {
     /// A host can defer session-bound features until its first app connection. Existing items
     /// never restart, so reconnect cannot revive a stopped owner or duplicate an instance.
     pub fn load_more(&mut self, list: &ActiveList) {
+        self.take_stops(list);
         for meta in list.for_game(&self.game.clone()) {
             if self.items.iter().any(|i| i.meta.id == meta.id) { continue; }
             let activation = self.next_activation();
@@ -549,7 +566,9 @@ impl FeatureSet {
     /// the rules of its session version apply (plan R1-B5), not the list's newer version.
     fn open(&self, meta: &ActiveFeature, activation: u64, load: impl FnOnce(&ActiveFeature) -> Result<Entry, String>) -> Result<Entry, Open> {
         if meta.multiplayer == Multiplayer::Blocked && self.multiplayer {
-            Err(Open::Blocked)
+            Err(Open::Blocked(NOT_IN_MULTIPLAYER.into()))
+        } else if let Some(stop) = self.stop_for(meta) {
+            Err(Open::Blocked(policy_detail(stop)))
         } else if meta.capabilities.contains(&Capability::Unknown) {
             // Checked before the load: a library that needs a call this host lacks never runs.
             Err(Open::Refused(UNKNOWN_CAPABILITY.into()))
@@ -559,7 +578,7 @@ impl FeatureSet {
                     Ok(()) => Open::Cleaned(e),
                     Err(c) => {
                         self.backend.log(&format!("feature {} cleanup failed after a load failure: {c}", meta.id));
-                        Open::Refused(format!("{e}; cleanup failed; restart the game: {c}"))
+                        Open::Refused(format!("{e}; cleanup failed; restart the application session: {c}"))
                     }
                 }),
                 Admit::Wait(why) => Err(Open::Wait(why)),
@@ -584,6 +603,8 @@ impl FeatureSet {
         // session keeps the version that it has (review R2-B3). The new games count for a
         // feature that did not start yet.
         let wanted: Vec<ActiveFeature> = list.features.clone();
+        self.take_stops(list);
+        self.apply_stops();
         let gone: Vec<String> = self.items.iter().filter(|i| i.run.is_some() && !wanted.iter().any(|m| m.id == i.meta.id)).map(|i| i.meta.id.clone()).collect();
         for id in gone {
             self.stop(&id, State::Stopped, Some(TURNED_OFF.into()));
@@ -652,7 +673,7 @@ impl FeatureSet {
     /// Adds one feature with its entry (tests give a function from this binary).
     pub fn add(&mut self, meta: ActiveFeature, start_fn: Result<Entry, Option<String>>) {
         let activation = self.next_activation();
-        let item = self.launch(meta, activation, start_fn.map_err(|e| e.map_or(Open::Blocked, Open::Refused)), None);
+        let item = self.launch(meta, activation, start_fn.map_err(|e| e.map_or_else(|| Open::Blocked(NOT_IN_MULTIPLAYER.into()), Open::Refused)), None);
         self.items.push(item);
     }
 
@@ -664,9 +685,9 @@ impl FeatureSet {
         let pending = self.backend.completion() == Completion::Pending;
         let mut cleaning = None;
         let run = match start_fn {
-            Err(Open::Blocked) => {
+            Err(Open::Blocked(why)) => {
                 status.state = State::Blocked;
-                status.detail = Some("not loaded in multiplayer".into());
+                status.detail = Some(why);
                 None
             }
             Err(Open::Refused(e)) => {
@@ -705,7 +726,7 @@ impl FeatureSet {
                         }
                         Err(cleanup) => {
                             self.backend.log(&format!("feature {} cleanup failed after start: {cleanup}", meta.id));
-                            format!("{e}; cleanup failed; restart the game: {cleanup}")
+                            format!("{e}; cleanup failed; restart the application session: {cleanup}")
                         }
                     });
                     None
@@ -787,11 +808,15 @@ impl FeatureSet {
 
     /// A game event with its attributes (native names) to every running feature. A version 4
     /// feature gets the attributes when it has vars_read; an older one gets the id only.
+    pub fn application_event<N: AsRef<str>>(&mut self, id: &str, attrs: &[(N, Var)]) {
+        self.game_event(id, attrs);
+    }
+
     pub fn game_event<N: AsRef<str>>(&mut self, id: &str, attrs: &[(N, Var)]) {
         // The page, control and settings prefixes belong to page(), control() and settings(): a
         // game event with one would pose as the member's page, input or settings.
         if abi::app_event(id) {
-            self.backend.log(&format!("game event {id} dropped: the prefixes {}, {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT, abi::SETTINGS_PREFIX));
+            self.backend.log(&format!("application event {id} dropped: the prefixes {}, {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT, abi::SETTINGS_PREFIX));
             return;
         }
         self.send(|_| true, id, attrs, false);
@@ -802,7 +827,7 @@ impl FeatureSet {
     /// ATS configuration events).
     pub fn game_event_to<N: AsRef<str>>(&mut self, feature: &str, id: &str, attrs: &[(N, Var)]) {
         if abi::app_event(id) {
-            self.backend.log(&format!("game event {id} dropped: the prefixes {}, {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT, abi::SETTINGS_PREFIX));
+            self.backend.log(&format!("application event {id} dropped: the prefixes {}, {} and {} are for the app", abi::PAGE_EVENT, abi::CONTROL_EVENT, abi::SETTINGS_PREFIX));
             return;
         }
         self.send(|i| i.meta.id == feature, id, attrs, false);
@@ -1001,24 +1026,56 @@ impl FeatureSet {
     pub fn cleanup_failed(&mut self, id: &str, error: &str) {
         if let Some(item) = self.items.iter_mut().find(|i| i.meta.id == id) {
             item.status.state = State::Failed;
-            item.status.detail = Some(format!("cleanup failed; restart the game: {error}"));
+            item.status.detail = Some(format!("cleanup failed; restart the application session: {error}"));
             self.backend.log(&format!("feature {id}: cleanup failed: {error}"));
         }
     }
 
-    /// A multiplayer client was found during the session: blocked features stop at once.
-    /// Returns true when a feature stopped. They start again only at the next game start.
-    pub fn set_multiplayer(&mut self, on: bool) -> bool {
-        if !on || self.multiplayer {
-            self.multiplayer |= on;
-            return false;
-        }
+    /// A multiplayer client was found (ATS: TruckersMP): features with the flag "blocked" and
+    /// features that a policy for this client stops "now" stop at once. Returns true when a
+    /// feature stopped. They start again only at the next game start (no start loop).
+    pub fn set_multiplayer(&mut self, client: &str) -> bool {
+        let first = !self.multiplayer;
         self.multiplayer = true;
-        let blocked: Vec<String> = self.items.iter().filter(|i| i.meta.multiplayer == Multiplayer::Blocked && i.run.is_some()).map(|i| i.meta.id.clone()).collect();
+        self.client = Some(client.to_string());
+        self.keep_applied();
+        let blocked: Vec<String> = self.items.iter().filter(|i| first && i.meta.multiplayer == Multiplayer::Blocked && i.run.is_some()).map(|i| i.meta.id.clone()).collect();
         for id in &blocked {
             self.stop(id, State::Blocked, Some("stopped: multiplayer started".into()));
         }
-        !blocked.is_empty()
+        self.apply_stops() | !blocked.is_empty()
+    }
+
+    /// Keeps the policies of this game from the list: the newest list decides, also for an
+    /// item that runs its own session record.
+    fn take_stops(&mut self, list: &ActiveList) {
+        self.stops = list.stops.iter().filter(|s| s.game == self.game).cloned().collect();
+        self.keep_applied();
+    }
+
+    /// Adds the policies that apply now (this client, or always) to `applied`.
+    fn keep_applied(&mut self) {
+        let client = self.client.clone();
+        for s in self.stops.iter().filter(|s| s.applies(client.as_deref())) {
+            if !self.applied.contains(s) { self.applied.push(s.clone()); }
+        }
+    }
+
+    /// The policy that keeps this feature record off in this game session, if any.
+    fn stop_for(&self, meta: &ActiveFeature) -> Option<&PolicyStop> {
+        self.applied.iter().find(|s| s.is_for(meta))
+    }
+
+    /// Stops each running feature that a policy stops "now" (decision D4); a "next start"
+    /// policy lets the running start go on, and `open` refuses the next one. True: one stopped.
+    fn apply_stops(&mut self) -> bool {
+        let client = self.client.as_deref();
+        let now_stop = |m: &ActiveFeature| self.stops.iter().find(|s| s.is_for(m) && s.apply == Apply::Now && s.applies(client));
+        let now: Vec<(String, String)> = self.items.iter().filter(|i| i.run.is_some()).filter_map(|i| now_stop(&i.meta).map(|s| (i.meta.id.clone(), policy_detail(s)))).collect();
+        for (id, why) in &now {
+            self.stop(id, State::Blocked, Some(format!("stopped: {why}")));
+        }
+        !now.is_empty()
     }
 
     pub fn multiplayer(&self) -> bool {
@@ -2185,12 +2242,12 @@ pub(crate) mod tests {
         s.add(meta("ok", &caps, Multiplayer::Allowed), Ok(entry()));
         s.add(meta("risky", &caps, Multiplayer::Risk), Ok(entry()));
         s.add(meta("blocked", &caps, Multiplayer::Blocked), Ok(entry()));
-        assert!(s.set_multiplayer(true));
+        assert!(s.set_multiplayer("truckersmp"));
         let st: Vec<_> = s.statuses().into_iter().map(|f| (f.id, f.state)).collect();
         assert_eq!(st, [("ok".into(), State::Running), ("risky".into(), State::Running), ("blocked".into(), State::Blocked)]);
-        assert!(!s.set_multiplayer(true), "only once");
+        assert!(!s.set_multiplayer("truckersmp"), "only once");
         // At load in multiplayer: a blocked feature is not even loaded.
-        let list = ActiveList { features: vec![meta("blocked", &caps, Multiplayer::Blocked)] };
+        let list = ActiveList { features: vec![meta("blocked", &caps, Multiplayer::Blocked)], ..Default::default() };
         let s2 = FeatureSet::load("ats", &list, Arc::new(B(rec.clone())), true);
         assert_eq!(s2.statuses()[0].state, State::Blocked);
     }
@@ -2198,7 +2255,7 @@ pub(crate) mod tests {
     #[test]
     fn a_missing_or_foreign_library_fails_alone() {
         let rec = Arc::new(Rec::default());
-        let mut list = ActiveList { features: vec![meta("gone", &[], Multiplayer::Allowed)] };
+        let mut list = ActiveList { features: vec![meta("gone", &[], Multiplayer::Allowed)], ..Default::default() };
         list.features[0].library = std::env::temp_dir().join("fm-no-such-feature.dll");
         list.features.push(ActiveFeature { games: vec!["msfs2024".into()], ..meta("other-game", &[], Multiplayer::Allowed) });
         let s = FeatureSet::load("ats", &list, Arc::new(B(rec.clone())), false);
@@ -2227,7 +2284,7 @@ pub(crate) mod tests {
         assert!(logs.iter().any(|l| l == "[weather] cmd:g_set_time.12: Err(Refused)"), "not declared: {logs:?}");
         assert!(logs.iter().any(|l| l == "[weather] cmd:g_set_weather.1;quit: Err(BadArgs)"), "no second command");
         assert!(logs.iter().any(|l| l == "[no-cap] cmd:g_set_weather.1.i: Err(Refused)"), "no game_command");
-        assert!(s.set_multiplayer(true));
+        assert!(s.set_multiplayer("truckersmp"));
         s.event("cmd:g_set_weather.0.i");
         let sent = rec.commands.lock().unwrap().iter().filter(|(_, t)| t != "<stopping>").count();
         assert_eq!(sent, 1, "multiplayer: the blocked feature stopped and sent nothing");
@@ -2430,7 +2487,7 @@ pub(crate) mod tests {
 
         s.event(&format!("get:{METAR}"));
         assert_eq!(s.waiting(), 2);
-        assert!(s.set_multiplayer(true), "network is allowed in multiplayer, but a blocked feature stops");
+        assert!(s.set_multiplayer("truckersmp"), "network is allowed in multiplayer, but a blocked feature stops");
         assert_eq!(s.waiting(), 1, "the stop dropped the request of slow only");
         assert!(!s.http_answer("slow", 3, Ok(HttpAnswer { status: 200, body: vec![] })));
         assert!(s.http_answer("other", 4, Ok(HttpAnswer { status: 200, body: b"ok".to_vec() })), "network still runs in multiplayer");
@@ -2488,7 +2545,7 @@ pub(crate) mod tests {
     }
 
     fn list(features: &[ActiveFeature]) -> ActiveList {
-        ActiveList { features: features.to_vec() }
+        ActiveList { features: features.to_vec(), ..Default::default() }
     }
 
     fn version(id: &str, v: &str) -> ActiveFeature {
@@ -2529,6 +2586,71 @@ pub(crate) mod tests {
         s.stop_all();
         assert_eq!(s.sync_with(&both, load_ok), ["a", "b"]);
         assert_eq!((starts(&rec, "a"), starts(&rec, "b")), (2, 3));
+    }
+
+    /// Game policies plan, slice 2: a policy for this game keeps a feature off. "now" stops a
+    /// running feature within one sync, "next start" lets it run and refuses its next start, a
+    /// multiplayer policy waits for its client, and a policy of another game does nothing.
+    #[test]
+    fn game_policies_stop_and_refuse_features() {
+        use crate::active::{Apply, PolicyStop, When};
+        let rec = Arc::new(Rec::default());
+        let mut s = set(&rec);
+        let open = |id: &str| ActiveFeature { multiplayer: Multiplayer::Allowed, ..version(id, "1.0.0") };
+        let stop = |id: &str, game: &str, when: When, apply: Apply| PolicyStop { feature: id.into(), version: None, game: game.into(), when, apply, policy: format!("p-{id}"), reason: "Asked by the game developer.".into() };
+        let ids = ["now", "later", "mp", "other"].map(open);
+        assert_eq!(s.sync_with(&list(&ids), load_ok).len(), 4);
+        let mut l = list(&ids);
+        l.stops = vec![
+            stop("now", "ats", When::Always, Apply::NextStart),
+            stop("now", "ats", When::Always, Apply::Now),
+            stop("later", "ats", When::Always, Apply::NextStart),
+            stop("mp", "ats", When::Multiplayer(vec!["truckersmp".into()]), Apply::Now),
+            stop("other", "msfs2024", When::Always, Apply::Now),
+        ];
+        assert_eq!(s.sync_with(&l, load_ok), NONE);
+        let detail = |id: &str| format!("application policy p-{id}: Asked by the game developer.");
+        assert_eq!(state(&s, "now"), (State::Blocked, "1.0.0".into(), Some(format!("stopped: {}", detail("now")))));
+        assert_eq!(*rec.cleanups.lock().unwrap(), ["now"], "a stopped feature is cleaned up");
+        assert!(["later", "mp", "other"].iter().all(|id| state(&s, id).0 == State::Running), "next start, no client, other game");
+        // The member turns "later" off and on: its next start is refused with the policy.
+        assert_eq!(s.sync_with(&ActiveList { features: ["now", "mp", "other"].map(open).to_vec(), ..l.clone() }, load_ok), NONE);
+        assert_eq!(s.sync_with(&l, load_ok), NONE);
+        assert_eq!(state(&s, "later"), (State::Blocked, "1.0.0".into(), Some(detail("later"))));
+        // The client starts: the multiplayer policy stops "mp"; the name compares with no case.
+        assert!(s.set_multiplayer("TruckersMP"));
+        assert_eq!(state(&s, "mp").0, State::Blocked);
+        assert_eq!(state(&s, "other").0, State::Running);
+        // A new set with the client from the start: the policy refuses the first start.
+        let mut s = set(&rec);
+        s.set_multiplayer("truckersmp");
+        s.sync_with(&l, load_ok);
+        assert_eq!(state(&s, "mp"), (State::Blocked, "1.0.0".into(), Some(detail("mp"))));
+        assert_eq!(state(&s, "other").0, State::Running);
+        // Sol r1: a stop names a version. The session runs 1.0.0 while the list has 2.0.0; a stop
+        // for 2.0.0 does nothing to it, a stop for 1.0.0 stops it.
+        let mut s = set(&rec);
+        assert_eq!(s.sync_with(&list(&[open("v")]), load_ok), ["v"]);
+        let mut l = list(&[ActiveFeature { version: "2.0.0".into(), ..open("v") }]);
+        l.stops = vec![PolicyStop { version: Some("2.0.0".into()), ..stop("v", "ats", When::Always, Apply::Now) }];
+        s.sync_with(&l, load_ok);
+        assert_eq!(state(&s, "v").0, State::Running, "another version");
+        l.stops[0].version = Some("1.0.0".into());
+        s.sync_with(&l, load_ok);
+        assert_eq!(state(&s, "v"), (State::Blocked, "1.0.0".into(), Some(format!("stopped: {}", detail("v")))));
+        // Sol r1: the app leaves a feature that a policy stops everywhere out of the list, with
+        // its stop. It stops as Blocked (not turned off), and a lifted policy waits for the next
+        // game start.
+        let mut s = set(&rec);
+        assert_eq!(s.sync_with(&list(&[open("x")]), load_ok), ["x"]);
+        s.sync_with(&ActiveList { stops: vec![stop("x", "ats", When::Always, Apply::Now)], ..list(&[]) }, load_ok);
+        assert_eq!(state(&s, "x"), (State::Blocked, "1.0.0".into(), Some(format!("stopped: {}", detail("x")))));
+        assert_eq!(s.sync_with(&list(&[open("x")]), load_ok), NONE, "no start in this session");
+        // Sol r3: the same for a host whose first list already left the feature out.
+        let mut s = set(&rec);
+        s.sync_with(&ActiveList { stops: vec![stop("y", "ats", When::Always, Apply::Now)], ..list(&[]) }, load_ok);
+        assert_eq!(s.sync_with(&list(&[open("y")]), load_ok), NONE, "a lifted policy waits for the next game start");
+        assert_eq!(state(&s, "y"), (State::Blocked, "1.0.0".into(), Some(detail("y"))));
     }
 
     /// Decisions 2 and 5: an update in the session waits for the next game start, for a running
@@ -2661,7 +2783,7 @@ pub(crate) mod tests {
         assert!(logged(&rec, &format!("feature a: cleanup result for activation {a} ignored (not pending)")), "a second result is ignored");
         s.cleaned("b", b, Err("cannot restore".into()));
         assert_eq!(s.sync_with(&both, load_ok), ["a"]);
-        assert_eq!(state(&s, "b"), (State::Failed, "1.0.0".into(), Some("cleanup failed; restart the game: cannot restore".into())));
+        assert_eq!(state(&s, "b"), (State::Failed, "1.0.0".into(), Some("cleanup failed; restart the application session: cannot restore".into())));
         assert_eq!(s.sync_with(&both, load_ok), NONE, "a failed cleanup is final");
     }
 
@@ -2682,7 +2804,7 @@ pub(crate) mod tests {
         assert_eq!(s.sync_with(&list(&[version("b", "1.0.0")]), fail), NONE);
         let b = activation(&s, "b").unwrap();
         s.cleaned("b", b, Err("inputs held".into()));
-        assert_eq!(state(&s, "b").2, Some("cleanup failed; restart the game: inputs held".into()));
+        assert_eq!(state(&s, "b").2, Some("cleanup failed; restart the application session: inputs held".into()));
     }
 
     /// No start loop: failed, blocked and a cleanup failure stay until the next game start.
@@ -2696,11 +2818,11 @@ pub(crate) mod tests {
         s.game_event_to::<&str>("boom", "boom", &[]);
         rec.bad_cleanup.lock().unwrap().push("held".into());
         s.sync_with(&list(&[version("boom", "1.0.0"), version("gone", "1.0.0"), version("mp", "1.0.0")]), load);
-        assert!(s.set_multiplayer(true));
+        assert!(s.set_multiplayer("truckersmp"));
         assert_eq!(s.sync_with(&all, load), NONE);
         assert_eq!(state(&s, "boom").0, State::Failed);
         assert_eq!(state(&s, "gone").0, State::Failed);
-        assert_eq!(state(&s, "held"), (State::Failed, "1.0.0".into(), Some("cleanup failed; restart the game: cannot restore".into())));
+        assert_eq!(state(&s, "held"), (State::Failed, "1.0.0".into(), Some("cleanup failed; restart the application session: cannot restore".into())));
         assert_eq!(state(&s, "mp").0, State::Blocked);
         assert_eq!((starts(&rec, "boom"), starts(&rec, "held"), starts(&rec, "mp")), (1, 1, 1));
         // A new feature that is blocked in multiplayer does not start either.

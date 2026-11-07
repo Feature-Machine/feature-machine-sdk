@@ -5,15 +5,30 @@ pub use fm_paths::{data_dir, data_dir_override, features_dir, isolate_from_env, 
 
 pub mod files;
 pub mod feature_parts;
-pub mod game_files;
+pub mod application_files;
+// Existing record paths and source callers keep the legacy name during migration.
+pub use application_files as game_files;
 pub mod inject;
 pub mod memory;
 pub mod install;
 pub mod keyboard;
-pub mod games;
+pub mod notify;
+pub mod applications;
 mod msstore;
 pub mod process;
+pub mod process_tree;
+pub mod stdio;
+pub mod uninstall;
 mod steam;
 mod version;
 
-pub use games::{detect as detect_games, Detector, Game, GameInstall, Source};
+pub use applications::{detect as detect_applications, Detector, ApplicationId, ApplicationInstall, ApplicationInstance, ApplicationService, InstanceKind, Source};
+pub use fm_application::ApplicationDefinition;
+
+// Existing SDK and tool callers retain their source names while neutral callers migrate.
+pub use applications::{detect as detect_games, ApplicationId as Game, ApplicationInstall as GameInstall};
+pub mod games {
+    pub use crate::applications::*;
+    pub use fm_application::ApplicationId as Game;
+    pub use crate::applications::ApplicationInstall as GameInstall;
+}

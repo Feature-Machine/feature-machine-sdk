@@ -3,7 +3,7 @@
 // ats-mod/ (files for the ATS mod folder) and msfs-community/<package>/ (one MSFS Community
 // package). The manifest is checked before anything installs, so a bad id or path can never
 // leave the store folder or reach a game folder outside the part it belongs to.
-use fm_platform::Game;
+use fm_platform::ApplicationId;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Seek};
 use std::path::{Component, Path, PathBuf};
@@ -17,15 +17,68 @@ pub use fm_input::ControlDecl;
 /// The most controls that a feature can declare: a member binds each one by hand.
 pub const MAX_CONTROLS: usize = 32;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
+    pub format: u32,
     pub id: String,
     pub name: String,
     pub version: String,
     /// One sentence for the Library card and the consent dialog.
     pub description: String,
     pub api: u32,
-    pub games: Vec<Game>,
+    pub games: Vec<ApplicationId>,
+    pub capabilities: Vec<Capability>,
+    pub multiplayer: Multiplayer,
+    /// Why the review set "risk" or "blocked"; shown to the member.
+    pub multiplayer_note: Option<String>,
+    /// UI page in ui/ (for example "index.html"), when the feature has one.
+    pub ui: Option<String>,
+    /// First words of the engine commands that the feature runs (API 2, capability
+    /// game_command); consent shows them, and the host refuses any other command.
+    pub game_commands: Vec<String>,
+    /// Hosts that the feature reaches with HTTPS GET (API 3, capability network); consent shows
+    /// each one, and the hosts and the app refuse any other host (parent plan Q14).
+    pub network_hosts: Vec<String>,
+    /// Map packages carried with this feature, pinned by digest. Consent lists them. Without
+    /// vars_memory and vars_write they are camera maps with no signature of ours (plan 6c).
+    pub memory_maps: Vec<MapDependency>,
+    /// The camera contract of pinned maps, by map id; consent asks again when it changes (plan
+    /// 6b answer 2). A top-level field, because older apps and hosts ignore unknown fields here
+    /// but refuse them in a pin (MapDependency) and so the whole catalog (review round 2).
+    pub map_contracts: std::collections::BTreeMap<String, String>,
+    /// Named controls that the member binds in the app (API 5, capability controls); consent
+    /// lists them. Default bindings are keyboard and mouse only (control input plan).
+    pub controls: Vec<ControlDecl>,
+    /// Game files that the feature reads or changes in the game's user folder (API 5, capability
+    /// user_files, fm_feature_sdk::files); consent lists each one, and the hosts refuse others.
+    pub user_files: Vec<UserFile>,
+    /// Maps that a module provides (module layer plan 8.1): by interface and map id, never by
+    /// module. The lock selects the provider; the host reads a required map only from it, also
+    /// when the package carries an embedded copy for older apps (they ignore this field).
+    pub requires: Vec<Requirement>,
+    /// The oldest app version that this build runs on (release-admin item 6, crate::release).
+    /// In the signed package, so the feed cannot lower it. Apps before 0.2 ignore it.
+    pub min_app: Option<String>,
+    /// API 6: page, icon, banner, widgets and settings (crate::surfaces). Flattened, so the
+    /// fields sit at the top of feature.json and an API 1 to 5 manifest has none of them.
+    pub surfaces: crate::surfaces::Surfaces,
+}
+
+// The remote type constructs the public manifest on read, so a new field cannot be omitted.
+// New output has its own format identity; signed package bytes are verified before conversion.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Manifest")]
+struct ManifestWire {
+    #[serde(default = "legacy_format", skip_serializing_if = "is_legacy_format")]
+    pub format: u32,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// One sentence for the Library card and the consent dialog.
+    pub description: String,
+    pub api: u32,
+    #[serde(alias = "applications")]
+    pub games: Vec<ApplicationId>,
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub multiplayer: Multiplayer,
@@ -38,6 +91,7 @@ pub struct Manifest {
     /// First words of the engine commands that the feature runs (API 2, capability
     /// game_command); consent shows them, and the host refuses any other command.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(alias = "application_commands")]
     pub game_commands: Vec<String>,
     /// Hosts that the feature reaches with HTTPS GET (API 3, capability network); consent shows
     /// each one, and the hosts and the app refuse any other host (parent plan Q14).
@@ -74,6 +128,22 @@ pub struct Manifest {
     #[serde(flatten)]
     pub surfaces: crate::surfaces::Surfaces,
 }
+impl Serialize for Manifest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.format == 1 { return ManifestWire::serialize(self, serializer); }
+        let mut value = ManifestWire::serialize(self, serde_json::value::Serializer).map_err(serde::ser::Error::custom)?;
+        if self.format == 2 { crate::representation::neutral_manifest(&mut value); }
+        value.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Manifest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ManifestWire::deserialize(deserializer)
+    }
+}
+fn legacy_format() -> u32 { 1 }
+fn is_legacy_format(format: &u32) -> bool { *format == 1 }
+
 
 pub use fm_feature_sdk::active::Requirement;
 
@@ -96,6 +166,7 @@ fn bad(m: String) -> io::Error {
 impl Manifest {
     /// Every rule a package must meet before the store or a game folder sees it.
     pub fn check(&self) -> io::Result<()> {
+        if !matches!(self.format, 1 | 2) { return Err(bad("unsupported feature manifest format".into())); }
         check_id(&self.id)?;
         crate::check_version(&self.version)?;
         crate::release::check_min_app(&self.id, self.min_app.as_deref()).map_err(bad)?;
@@ -106,7 +177,7 @@ impl Manifest {
             return Err(bad(format!("{} needs a capability that this version of Feature Machine does not know", self.id)));
         }
         if self.games.is_empty() {
-            return Err(bad(format!("{} names no game", self.id)));
+            return Err(bad(format!("{} names no application", self.id)));
         }
         if self.name.trim().is_empty() || self.name.len() > 60 {
             return Err(bad(format!("{}: the name must have 1 to 60 characters", self.id)));
@@ -256,11 +327,11 @@ impl Manifest {
             return Ok(());
         }
         if self.api < 2 || !self.capabilities.contains(&Capability::GameCommand) {
-            return Err(bad(format!("{} lists game commands but has not API 2 and the game_command capability", self.id)));
+            return Err(bad(format!("{} lists application commands but has not API 2 and the application_command capability", self.id)));
         }
         let word = |w: &&String| (1..=40).contains(&w.len()) && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
         if let Some(c) = self.game_commands.iter().find(|c| !word(c)) {
-            return Err(bad(format!("{}: bad game command {c:?}", self.id)));
+            return Err(bad(format!("{}: bad application command {c:?}", self.id)));
         }
         Ok(())
     }
@@ -270,7 +341,7 @@ impl Manifest {
         self.surfaces.page.as_ref().map(|p| p.entry.as_str()).or(self.ui.as_deref())
     }
 
-    pub fn runs_on(&self, game: Game) -> bool {
+    pub fn runs_on(&self, game: ApplicationId) -> bool {
         self.games.contains(&game)
     }
 }
@@ -306,7 +377,7 @@ pub fn inspect<R: Read + Seek>(zip: R) -> io::Result<(Manifest, Vec<String>)> {
     found.dedup();
     let game_files = found.iter().any(|p| p == parts::ATS_MOD || p == parts::MSFS_COMMUNITY);
     if game_files && !m.capabilities.contains(&Capability::GameFiles) {
-        return Err(bad(format!("{} adds game files but does not declare game_files", m.id)));
+        return Err(bad(format!("{} adds application files but does not declare application_files", m.id)));
     }
     if !entries.iter().any(|(p, dir)| !dir && *p == safe_rel(&parts::library()).unwrap_or_default()) {
         return Err(bad(format!("{} has no library for this system ({})", m.id, parts::library())));
@@ -591,13 +662,13 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn manifest() -> Manifest {
-        Manifest {
+        Manifest { format: 1,
             id: "speed-alert".into(),
             name: "Speed alert".into(),
             version: "1.0.0".into(),
             description: "Warns above a speed.".into(),
             api: FEATURE_API,
-            games: vec![Game::Ats],
+            games: vec![ApplicationId::ATS],
             capabilities: vec![Capability::VarsRead, Capability::UiApp],
             multiplayer: Multiplayer::Allowed,
             multiplayer_note: None,
@@ -622,7 +693,7 @@ pub(crate) mod tests {
         assert!(Manifest { capabilities: vec![Capability::UiApp], ..m.clone() }.check().is_err(), "files need the capability");
         assert!(Manifest { api: 4, ..m.clone() }.check().is_err(), "user_files needs API 5");
         assert!(Manifest { user_files: vec![file("../Documents/x", Access::Read)], ..m.clone() }.check().is_err());
-        assert!(Manifest { games: vec![Game::Msfs2024], ..m.clone() }.check().is_err(), "a game of the feature with a user folder");
+        assert!(Manifest { games: vec![ApplicationId::MSFS2024], ..m.clone() }.check().is_err(), "a game of the feature with a user folder");
     }
 
     #[test]

@@ -58,7 +58,7 @@ pub struct AppEntry<'a> {
     pub root: &'a Path,
     pub launcher: &'a Path,
     pub version: &'a str,
-    /// Icon file (Linux desktop file); Windows uses the launcher's own icon.
+    /// Icon file (Linux desktop file, Windows toasts); the Windows Apps entry uses the launcher icon.
     pub icon: Option<&'a Path>,
 }
 
@@ -126,7 +126,8 @@ mod windows_impl {
         walk(dir) / 1024
     }
 
-    /// Writes the Apps entry, the link and the Start menu shortcut (current user only).
+    /// Writes the Apps entry, the link, the Start menu shortcut and the toast app id (current
+    /// user only).
     pub fn register(e: &AppEntry) -> io::Result<()> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let launcher = e.launcher.display().to_string();
@@ -151,7 +152,7 @@ mod windows_impl {
         if let Some(lnk) = shortcut() {
             make_shortcut(&lnk, e.launcher)?;
         }
-        Ok(())
+        crate::notify::register(e.icon)
     }
 
     /// Removes what register wrote. A part that is already gone is not an error.
@@ -169,7 +170,7 @@ mod windows_impl {
                 _ => {}
             }
         }
-        Ok(())
+        crate::notify::unregister()
     }
 
     /// Start menu shortcut through the Shell COM interface (IShellLinkW, IPersistFile).
@@ -262,7 +263,7 @@ mod linux_impl {
         let exec = exec_arg(e.launcher);
         let icon = e.icon.map(|i| format!("Icon={}\n", i.display())).unwrap_or_default();
         let text = format!(
-            "[Desktop Entry]\nType=Application\nName={PRODUCT}\nComment=Mods for your games\nExec={exec} %u\n{icon}Terminal=false\nCategories=Game;Utility;\nMimeType=x-scheme-handler/{LINK_SCHEME};\nX-FeatureMachine-Version={}\nActions=Uninstall;\n\n[Desktop Action Uninstall]\nName=Uninstall {PRODUCT}\nExec={exec} --uninstall\n",
+            "[Desktop Entry]\nType=Application\nName={PRODUCT}\nComment=Features for your applications\nExec={exec} %u\n{icon}Terminal=false\nCategories=Game;Utility;\nMimeType=x-scheme-handler/{LINK_SCHEME};\nX-FeatureMachine-Version={}\nActions=Uninstall;\n\n[Desktop Action Uninstall]\nName=Uninstall {PRODUCT}\nExec={exec} --uninstall\n",
             e.version
         );
         crate::files::write_replace(&file, text.as_bytes())?;

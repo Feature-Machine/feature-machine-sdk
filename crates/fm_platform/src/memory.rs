@@ -86,7 +86,7 @@ mod win {
     impl Memory for Reader {
         fn identity(&self) -> Result<ModuleId, Error> {
             let mut exit = 0;
-            if unsafe { GetExitCodeProcess(self.process, &mut exit) } == 0 || exit != 259 { return Err(Error::Unavailable("game process exited".into())); }
+            if unsafe { GetExitCodeProcess(self.process, &mut exit) } == 0 || exit != 259 { return Err(Error::Unavailable("application process exited".into())); }
             Ok(self.id.clone())
         }
         fn read(&self, address: u64, size: usize) -> Result<Vec<u8>, Error> {

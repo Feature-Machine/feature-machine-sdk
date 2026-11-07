@@ -29,6 +29,17 @@ pub fn legacy_dir(feed: &str) -> PathBuf {
     Path::new(feed).join("features")
 }
 
+pub fn v3_dir(feed: &str) -> PathBuf { Path::new(feed).join("v3/features") }
+
+fn compatible(manifest: &fm_install::feature::Manifest) -> bool {
+    manifest.format == 1 && manifest.games.iter().all(|id| matches!(*id, fm_platform::ApplicationId::ATS | fm_platform::ApplicationId::MSFS2024))
+}
+
+pub fn v3_history(feed: &str, id: &str) -> Result<History, String> {
+    let file = v3_dir(feed).join(history_path(id));
+    if file.exists() { read_json(&file) } else { v2_history(feed, id) }
+}
+
 pub fn v2_dir(feed: &str) -> PathBuf {
     Path::new(feed).join("v2/features")
 }
@@ -115,15 +126,20 @@ fn newest(h: &History, channel: Channel) -> Option<&CatalogEntry> {
 /// Writes the v2 history of `id` and every view derived from it, histories before catalogs, so
 /// a reader never sees a catalog entry whose history file is missing.
 pub fn write(feed: &str, id: &str, v2: &History) -> Result<(), String> {
-    let (legacy, v2dir) = (legacy_dir(feed), v2_dir(feed));
+    let (legacy, v2dir, v3dir) = (legacy_dir(feed), v2_dir(feed), v3_dir(feed));
     let path = history_path(id);
+    let canonical_index = v3dir.join("index.json");
+    let mut index: Index = read_json(&canonical_index)?;
+    if !index.ids.iter().any(|i| i == id) { index.ids.push(id.to_string()); index.ids.sort(); }
+    write_json(&canonical_index, &index)?;
+    write_json(&v3dir.join(&path), v2)?;
+    write_current_catalog(&v3dir, id, v2)?;
+    let old = History { versions: v2.versions.iter().filter(|v| compatible(&v.entry.manifest)).cloned().collect() };
+    let v2 = &old;
     let mut index: Index = read_json(&index_file(feed))?;
-    if !index.ids.iter().any(|i| i == id) {
-        index.ids.push(id.to_string());
-        index.ids.sort();
-        write_json(&index_file(feed), &index)?;
-    }
-    write_json(&v2dir.join(&path), v2)?;
+    if !v2.versions.is_empty() && !index.ids.iter().any(|i| i == id) { index.ids.push(id.to_string()); index.ids.sort(); }
+    if !index.ids.is_empty() || index_file(feed).exists() { write_json(&index_file(feed), &index)?; }
+    if !v2.versions.is_empty() || v2dir.join(&path).exists() { write_json(&v2dir.join(&path), v2)?; }
     // Legacy: Stable versions that an app 0.1.x can run. A Preview-only feature gets no file.
     let mut old = History::default();
     for v in v2.versions.iter().filter(|v| v.entry.channel == Channel::Stable && v.entry.manifest.api <= LEGACY_API && fits_app(v.entry.manifest.min_app.as_deref(), LEGACY_APP)) {
@@ -142,15 +158,17 @@ pub fn write(feed: &str, id: &str, v2: &History) -> Result<(), String> {
     if !cat.features.is_empty() || legacy.join("catalog.json").exists() {
         write_json(&legacy.join("catalog.json"), &cat)?;
     }
-    // v2: the newest Stable version, and the newest Preview version only when it is newer
-    // (the app keeps the newest entry that it may take, so at most two entries per id).
-    let mut cat = read_catalog(&v2dir)?;
+    write_current_catalog(&v2dir, id, v2)
+}
+
+fn write_current_catalog(dir: &Path, id: &str, history: &History) -> Result<(), String> {
+    let mut cat = read_catalog(dir)?;
     cat.features.retain(|f| f.manifest.id != id);
-    let stable = newest(v2, Channel::Stable);
-    let preview = newest(v2, Channel::Preview).filter(|p| stable.is_none_or(|s| newer(&p.manifest.version, &s.manifest.version)));
-    cat.features.extend([stable, preview].into_iter().flatten().map(|e| CatalogEntry { history: Some(path.clone()), ..e.clone() }));
+    let stable = newest(history, Channel::Stable);
+    let preview = newest(history, Channel::Preview).filter(|p| stable.is_none_or(|s| newer(&p.manifest.version, &s.manifest.version)));
+    cat.features.extend([stable, preview].into_iter().flatten().map(|e| CatalogEntry { history: Some(history_path(id)), ..e.clone() }));
     cat.features.sort_by(|a, b| (&a.manifest.id, a.channel != Channel::Stable).cmp(&(&b.manifest.id, b.channel != Channel::Stable)));
-    write_json(&v2dir.join("catalog.json"), &cat)
+    write_json(&dir.join("catalog.json"), &cat)
 }
 
 /// a > b in semver precedence, through the app's own rule (fits_app: app >= min_app).
@@ -163,8 +181,9 @@ fn newer(a: &str, b: &str) -> bool {
 /// stopped after the v2 history upload left stale catalogs or a stale legacy history; the next
 /// run of any kind repairs them (code review r1). Views that are current keep their bytes.
 pub fn init(feed: &str) -> Result<(), String> {
-    let mut ids: Vec<String> = read_json::<Index>(&index_file(feed))?.ids;
-    for dir in [legacy_dir(feed), v2_dir(feed)] {
+    let mut ids: Vec<String> = read_json::<Index>(&v3_dir(feed).join("index.json"))?.ids;
+    ids.extend(read_json::<Index>(&index_file(feed))?.ids);
+    for dir in [legacy_dir(feed), v2_dir(feed), v3_dir(feed)] {
         ids.extend(read_catalog(&dir)?.features.into_iter().map(|f| f.manifest.id));
         if let Ok(dirs) = std::fs::read_dir(&dir) {
             ids.extend(dirs.flatten().filter(|d| d.path().join("versions.json").is_file()).map(|d| d.file_name().to_string_lossy().into_owned()));
@@ -176,7 +195,7 @@ pub fn init(feed: &str) -> Result<(), String> {
     for id in ids {
         fm_install::feature::check_id(&id).map_err(|e| e.to_string())?;
         // An indexed id whose history upload never happened has nothing to write.
-        let h = v2_history(feed, &id)?;
+        let h = v3_history(feed, &id)?;
         if h.versions.is_empty() { continue; }
         made += usize::from(!v2_dir(feed).join(history_path(&id)).exists());
         write(feed, &id, &h)?;
@@ -184,6 +203,7 @@ pub fn init(feed: &str) -> Result<(), String> {
     if !v2_dir(feed).join("catalog.json").exists() {
         write_json(&v2_dir(feed).join("catalog.json"), &Catalog::default())?;
     }
+    if !v3_dir(feed).join("catalog.json").exists() { write_json(&v3_dir(feed).join("catalog.json"), &Catalog::default())?; }
     println!("feed-init: {made} feature histories made in v2");
     Ok(())
 }
@@ -191,7 +211,7 @@ pub fn init(feed: &str) -> Result<(), String> {
 /// Adds a published package entry (URL already a file name) on `channel`.
 pub fn add(feed: &str, entry: CatalogEntry, channel: Channel, published: u64) -> Result<bool, String> {
     let id = entry.manifest.id.clone();
-    let mut h = v2_history(feed, &id)?;
+    let mut h = v3_history(feed, &id)?;
     let name = file_name(&entry.url).to_string();
     let art = entry.art.as_ref().map(|a| a.map_urls(|u| v2_url(file_name(u))));
     let added = h.add(CatalogEntry { url: v2_url(&name), channel, art, ..entry }, published)?;
@@ -204,7 +224,7 @@ pub fn add(feed: &str, entry: CatalogEntry, channel: Channel, published: u64) ->
 /// written again.
 pub fn promote(feed: &str, id: &str, version: &str) -> Result<(), String> {
     fm_install::feature::check_id(id).map_err(|e| e.to_string())?;
-    let mut h = v2_history(feed, id)?;
+    let mut h = v3_history(feed, id)?;
     let v = h.versions.iter_mut().find(|v| v.entry.manifest.version == version).ok_or_else(|| format!("{id} {version} is not on the feed"))?;
     if v.withdrawn { return Err(format!("{id} {version} is withdrawn")); }
     match v.entry.channel {
@@ -219,7 +239,7 @@ pub fn promote(feed: &str, id: &str, version: &str) -> Result<(), String> {
 /// Withdraws a version on every view: it stays in the histories and in files/.
 pub fn withdraw(feed: &str, id: &str, version: &str) -> Result<(), String> {
     fm_install::feature::check_id(id).map_err(|e| e.to_string())?;
-    let mut h = v2_history(feed, id)?;
+    let mut h = v3_history(feed, id)?;
     h.withdraw(version)?;
     println!("withdrawn: {id} {version}");
     write(feed, id, &h)
@@ -405,5 +425,40 @@ mod tests {
         assert!(e.contains("other bytes"), "{e}");
         std::fs::copy(&zip, &file).unwrap();
         crate::catalog_with(&f.root(), &zip, &f.key.public(), Channel::Stable).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod application_views {
+    use super::*;
+    #[derive(serde::Deserialize)]
+    enum OldGame { #[serde(rename="ats")] Ats, #[serde(rename="msfs2024")] Msfs }
+    #[derive(serde::Deserialize)]
+    struct OldEntry { games: Vec<OldGame> }
+    #[derive(serde::Deserialize)]
+    struct OldCatalog { features: Vec<OldEntry> }
+
+    #[test]
+    fn neutral_packages_never_reach_old_catalogs_or_histories() {
+        let temp = tempfile::tempdir().unwrap();
+        let feed = temp.path().to_str().unwrap();
+        let entry = |id, target, format| serde_json::from_value::<CatalogEntry>(serde_json::json!({
+            "format":format,"id":id,"name":"Status","description":"Status data","version":"1.0.0","api":6,
+            "games":[target],"capabilities":[],"url":"files/status.zip","sha256":"a".repeat(64),"size":1,"signature":"s"
+        })).unwrap();
+        add(feed, entry("old-probe", "ats", 1), Channel::Stable, 1).unwrap();
+        add(feed, entry("new-probe", "dbox-haptisync-center", 2), Channel::Stable, 1).unwrap();
+        add(feed, entry("new-ats", "ats", 2), Channel::Stable, 1).unwrap();
+        let v2 = std::fs::read(temp.path().join("v2/features/catalog.json")).unwrap();
+        let old: OldCatalog = serde_json::from_slice(&v2).unwrap();
+        assert_eq!(old.features.len(), 1);
+        assert_eq!(old.features[0].games.len(), 1);
+        assert!(!temp.path().join("v2/features/new-probe/versions.json").exists());
+        let v3 = read_catalog(&temp.path().join("v3/features")).unwrap();
+        assert_eq!(v3.features.len(), 3);
+        promote(feed, "new-probe", "1.0.0").unwrap();
+        withdraw(feed, "new-probe", "1.0.0").unwrap();
+        assert_eq!(read_catalog(&temp.path().join("v3/features")).unwrap().features.len(), 2);
+        assert_eq!(std::fs::read(temp.path().join("v2/features/catalog.json")).unwrap(), v2);
     }
 }

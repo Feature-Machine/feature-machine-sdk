@@ -9,9 +9,18 @@ use std::time::{Duration, Instant};
 
 const POLICY: &str = include_str!("../review/policy.md");
 const SCHEMA: &str = include_str!("../review/verdict.schema.json");
-const OPENROUTER: &str = "https://openrouter.ai/api/v1/chat/completions";
+pub(crate) const OPENROUTER: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// The model when the job sets no FM_REVIEW_MODEL (repository variable, R24).
-const DEFAULT_MODEL: &str = "openai/gpt-6.1-sol";
+pub(crate) const DEFAULT_MODEL: &str = "openai/gpt-6.1-sol";
+
+/// The SHA-256 of policy.md: the policy version of a review, a ledger entry and an eval report.
+pub(crate) fn policy_version() -> String { crate::sha256_hex(POLICY.as_bytes()) }
+
+/// One review of a prepared folder with the job's budget, for `review-eval` (review_eval.rs):
+/// the same call, schema, checks and retries as the review job.
+pub(crate) fn review(dir: &Path, repository: &str, url: &str, key: &str, model: &str) -> Result<(), String> {
+    run(dir, repository, url, key, model, Instant::now() + BUDGET, &mut std::thread::sleep)
+}
 /// The largest user message, about 250,000 tokens. A larger submission fails in S1.
 const MAX_INPUT: usize = 1_000_000;
 /// The most raster art bytes that one review sends as images (the banner is at most 1 MB and
@@ -21,9 +30,15 @@ const MAX_IMAGES: u64 = 6 * 1024 * 1024;
 /// fm_pack review-run <prepared dir> <owner/repository>: OPENROUTER_API_KEY is the key;
 /// FM_REVIEW_MODEL, when set and not empty, names the model.
 pub fn command(dir: &str, repository: &str) -> Result<(), String> {
+    let (key, model) = key_and_model()?;
+    review(Path::new(dir), repository, OPENROUTER, &key, &model)
+}
+
+/// OPENROUTER_API_KEY, and FM_REVIEW_MODEL when it is set and not empty (else DEFAULT_MODEL).
+pub(crate) fn key_and_model() -> Result<(String, String), String> {
     let key = std::env::var("OPENROUTER_API_KEY").ok().filter(|k| !k.is_empty()).ok_or("OPENROUTER_API_KEY is not set")?;
     let model = std::env::var("FM_REVIEW_MODEL").ok().filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_MODEL.into());
-    run(Path::new(dir), repository, OPENROUTER, &key, &model, Instant::now() + BUDGET, &mut std::thread::sleep)
+    Ok((key, model))
 }
 
 /// Retries of one model call after a busy answer (429, 502, 503, 504), and the longest wait.
@@ -111,7 +126,7 @@ fn run(dir: &Path, repository: &str, url: &str, key: &str, model: &str, deadline
         calls.push(serde_json::json!({ "id": reply["id"], "model": reply["model"], "provider": reply["provider"], "usage": reply["usage"] }));
         // After each answer, so a review that fails still keeps the model and the cost of its calls.
         // policy: the SHA-256 of policy.md, the policy version of a ledger entry (plan S2 step 3).
-        std::fs::write(dir.join("model.json"), serde_json::to_vec_pretty(&serde_json::json!({ "requested": model, "policy": crate::sha256_hex(POLICY.as_bytes()), "calls": calls })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("model.json"), serde_json::to_vec_pretty(&serde_json::json!({ "requested": model, "policy": policy_version(), "calls": calls })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let text = reply["choices"][0]["message"]["content"].as_str().ok_or("model answer: no content")?.to_string();
         let problem = match serde_json::from_str::<Verdict>(&text) {
             Ok(v) => match v.check(&manifest, &crate::review::machine_roots()).and_then(|()| v.check_dependencies(&deps)) {
